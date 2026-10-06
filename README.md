@@ -31,3 +31,10 @@
 - **自带错误页**（缺 KV / 没设密码）→ 绑定没配，按上补齐。
 - **502 `origin_bad_gateway`**（带 `cloudflare_error:true`）→ CF 边缘生成，上游响应无效；长流式注意 CF Free 约 100s 源站超时。
 - **上游 4xx 原样透出**（带 `Access-Control-Allow-Origin`）= Worker 返回；只有 `CF-RAY` + `Cache-Control:private` = CF 裸错误页。
+
+## 参考项目
+
+本项目在开发过程中参考了以下开源项目，特此致谢。如需公开或二次分发，请遵守其各自的开源协议：
+
+- [Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api) —— Gemini 原生协议适配、调用配额与负载均衡等思路的参考来源。
+- [cmliussss2024/WorkersAI2API](https://github.com/cmliussss2024/WorkersAI2API) —— 同名参考实现，整体架构与部署形态的启发来源。
