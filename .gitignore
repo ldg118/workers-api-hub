@@ -1,0 +1,15 @@
+# WorkBuddy 内部数据（非项目源码，含记忆/日志）
+.workbuddy/
+
+# 本地改前/改后快照（可随时重新生成，体积大）
+_backup/
+
+# 旧副本（含已删除代码，脏数据）
+_worker - 副本.js
+
+# 一次性临时分析脚本
+_analyze_deadcode.mjs
+
+# 系统/编辑器
+.DS_Store
+Thumbs.db
