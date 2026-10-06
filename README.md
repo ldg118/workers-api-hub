@@ -89,21 +89,9 @@
 - **502 `origin_bad_gateway`**（带 `cloudflare_error:true`）→ CF 边缘生成，上游响应无效；长流式注意 CF Free 约 100s 源站超时。
 - **上游 4xx 原样透出**（带 `Access-Control-Allow-Origin`）= Worker 返回；只有 `CF-RAY` + `Cache-Control:private` = CF 裸错误页。
 
-## 参考项目与致谢
+## 参考项目
 
-本项目是一个**独立实现**的反向代理网关，并非上述任一项目的副本或 fork。开发过程中，以下两个开源项目在**设计思路、协议处理方案与部署形态**上提供了重要参考与启发，特此明确致谢并声明：
+本项目在开发过程中参考了以下开源项目，特此致谢：
 
-- **[Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api)**
-  - 主要参考点：**Gemini 原生 `generateContent` 协议适配层**的实现思路（包括 tools → `functionDeclarations` 转换、schema 清洗、流式回包处理、以及工具调用回放上 `thoughtSignature` 等细节）。
-  - 另参考了其**调用配额（quota）与负载均衡（调度冷却、成员切换、会话粘性）**的整体设计思路。
-  - 本项目在实现时对以上思路进行了独立重写，并适配到 Cloudflare Worker 单文件形态，未直接复制其源码。
-
-- **[cmliussss2024/WorkersAI2API](https://github.com/cmliussss2024/WorkersAI2API)**
-  - 主要参考点：**同名参考实现的整体架构与部署形态**——将多个上游渠道统一收敛为 OpenAI 兼容接口的网关范式，以及"单文件 `_worker.js` 复制进 Cloudflare 控制台即可部署"的极简部署思路。
-  - 本项目在其思路基础上扩展实现了 Anthropic 双协议、管理面板、D1 统计看板等功能。
-
-### 开源合规声明
-
-- 本项目在公开或二次分发时，将遵守上述被参考项目的各自开源许可证（License）。若您发现本项目的任何实现与参考项目存在许可证冲突或权利争议，请通过 Issue 联系，我们会第一时间处理。
-- 本仓库中的核心代码（`_worker.js`）为基于上述思路的**自主编写实现**，如有疑问欢迎对照核查。
-- 建议随仓库一并附带 LICENSE 文件以明确本项目自身的开源条款（详见上方待办）。
+- [Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api)
+- [cmliussss2024/WorkersAI2API](https://github.com/cmliussss2024/WorkersAI2API)
