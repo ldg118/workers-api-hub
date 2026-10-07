@@ -10,7 +10,7 @@
 // ★★ 硬约定：**每次改动 _worker.js 都要把版本号 +1**（日期变了就用新日期、序号归 1）。
 //    格式固定 `YYYY-MM-DD.N`。验证脚本会拦下格式不对的值，但「有没有 +1」只能靠自觉 ——
 //    曾经因为版本号没变，本地/线上分不清哪个是哪版，白排查了一整轮。
-const BUILD_ID = '2026-10-06.67';
+const BUILD_ID = '2026-10-06.68';
 
 // 系统默认密钥自动轮换参数
 const ROTATE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000; // 轮换周期：7 天
@@ -3169,7 +3169,62 @@ function extractSuggestedModel(errText) {
 
 // 探测单个模型是否可用：连通性 + 模型名有效性
 // 只发一句 ping，刻意不带 max_tokens（思考型模型给太小的输出预算会被上游直接拒绝）
-async function probeProviderModel(baseUrl, apiKey, model, timeoutMs = 25000) {
+// Gemini 渠道的连通性探测：走**原生 generateContent**，与 callProvider→callGeminiNative 同一条路。
+// 否则「测试」打的是 OpenAI 兼容端点、实际调用走原生，两者不一致：
+//   ① 原生路径坏了（thought_signature / schema 清洗）测试却是绿的（假阳性）；
+//   ② baseUrl 未带 /openai 时测试打 …/v1beta/chat/completions 会 404（假阴性）。
+async function probeGeminiNative(provider, model, timeoutMs) {
+	const base = geminiNativeBase(provider.baseUrl);
+	const m = String(model || '').replace(/^models\//i, '');
+	const endpoint = (base && m) ? `${base}/models/${m}:generateContent` : '';
+	const startedAt = Date.now();
+	if (!endpoint) {
+		return { model, ok: false, status: 0, elapsed: 0, endpoint, native: true, error: '缺少 baseUrl 或模型名' };
+	}
+	try {
+		const res = await fetch(endpoint, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', 'x-goog-api-key': provider.apiKey || '' },
+			body: JSON.stringify({
+				contents: [{ role: 'user', parts: [{ text: 'ping' }] }],
+				generationConfig: { maxOutputTokens: 16 }
+			}),
+			signal: AbortSignal.timeout(timeoutMs)
+		});
+		const elapsed = Date.now() - startedAt;
+		if (res.ok) {
+			const data = await res.json().catch(() => null);
+			const reply = (((data && data.candidates && data.candidates[0] && data.candidates[0].content
+				&& data.candidates[0].content.parts) || [])
+				.map(p => (p && p.text) || '').join('')).slice(0, 80);
+			return { model, ok: true, status: res.status, elapsed, endpoint, native: true, reply };
+		}
+		const errText = await res.text();
+		return {
+			model, ok: false, status: res.status, elapsed, endpoint, native: true,
+			error: `HTTP ${res.status}: ${errText.slice(0, 400)}`,
+			upstreamMessage: extractUpstreamMessage(errText),
+			suggestedModel: extractSuggestedModel(errText),
+			// native=true：不要给出「要填 …/v1beta/openai」那条对原生渠道是错误建议的提示
+			hint: buildProviderTestHint(res.status, provider.baseUrl, errText, model, true)
+		};
+	} catch (e) {
+		const isTimeout = e && e.name === 'TimeoutError';
+		return {
+			model, ok: false, status: 0, timedOut: isTimeout, elapsed: Date.now() - startedAt, endpoint, native: true,
+			error: isTimeout ? `超时（${Math.round(timeoutMs / 1000)} 秒内没有响应）` : `连接失败: ${e.message}`,
+			hint: isTimeout
+				? '上游长时间没返回。思考型模型本身较慢，可以稍后重试；若多次超时，检查该渠道是否可用。'
+				: '检查 Base URL 是否可达（域名拼写、是否需要走代理），以及该地址是否对公网开放。'
+		};
+	}
+}
+
+async function probeProviderModel(baseUrl, apiKey, model, timeoutMs = 25000, provider = null) {
+	// 测试必须跟真实调用走同一条路：Gemini 渠道实际走原生 generateContent（见 callProvider）
+	const asProvider = provider || { baseUrl, apiKey };
+	if (isGeminiProvider(asProvider)) return probeGeminiNative({ ...asProvider, baseUrl, apiKey }, model, timeoutMs);
+
 	const endpoint = String(baseUrl || '').replace(/\/+$/, '') + '/chat/completions';
 	const headers = { 'Content-Type': 'application/json' };
 	if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
@@ -3227,7 +3282,7 @@ async function probeProviderModel(baseUrl, apiKey, model, timeoutMs = 25000) {
 
 // 把常见失败翻译成可操作的提示，避免"测试不通但不知道为什么"
 // 优先级：输入本身的硬事实 → 上游正文里的明确线索 → baseUrl 路径事实 → 状态码兜底
-function buildProviderTestHint(status, baseUrl, errText, model) {
+function buildProviderTestHint(status, baseUrl, errText, model, native = false) {
 	const lowerBase = String(baseUrl || '').toLowerCase();
 	const lowerErr = String(errText || '').toLowerCase();
 
@@ -3255,7 +3310,8 @@ function buildProviderTestHint(status, baseUrl, errText, model) {
 
 	// --- Base URL 本身就是硬事实，比正文里的"模型不存在"更值得先修 ---
 	// （地址少一层时上游也常回"model not found"，照正文提示会把人带偏）
-	if (lowerBase.includes('generativelanguage.googleapis.com') && !lowerBase.includes('/openai')) {
+	// native 渠道（走原生 generateContent）不需要 /openai —— 这条提示只对「被迫落回 OpenAI 兼容端点」的渠道成立
+	if (!native && lowerBase.includes('generativelanguage.googleapis.com') && !lowerBase.includes('/openai')) {
 		return 'Base URL 少了一层：Gemini 的原生端点不是 OpenAI 格式，要填 https://generativelanguage.googleapis.com/v1beta/openai。';
 	}
 	if (lowerBase.includes('api.anthropic.com') && !/\/v1\/?$/.test(lowerBase)) {
@@ -4298,10 +4354,14 @@ async function handleDashboardApi(request, env, ctx) {
 
 		// 并发限 4：思考型模型单个可能十几秒，全并发容易被上游限流
 		const CONCURRENCY = 4;
+		// 测试要跟真实调用同路：Gemini 渠道走原生（isGeminiProvider 判定），其余走 OpenAI 兼容端点
+		const probeTarget = provider
+			? { ...provider, baseUrl: targetBaseUrl, apiKey: targetKey }
+			: { baseUrl: targetBaseUrl, apiKey: targetKey, name: '未保存的渠道' };
 		const results = [];
 		for (let i = 0; i < list.length; i += CONCURRENCY) {
 			const batch = list.slice(i, i + CONCURRENCY);
-			const settled = await Promise.all(batch.map(m => probeProviderModel(targetBaseUrl, targetKey, m)));
+			const settled = await Promise.all(batch.map(m => probeProviderModel(targetBaseUrl, targetKey, m, undefined, probeTarget)));
 			results.push(...settled);
 		}
 
@@ -4341,9 +4401,13 @@ async function handleDashboardApi(request, env, ctx) {
 			await saveProviders(env, (config.providers || []).map(p => p.id === provider.id ? provider : p));
 		}
 
+		const nativeMode = isGeminiProvider(probeTarget);
 		return new Response(JSON.stringify({
 			success: results.every(r => r.ok),
-			endpoint: String(targetBaseUrl).replace(/\/+$/, '') + '/chat/completions',
+			endpoint: nativeMode
+				? geminiNativeBase(targetBaseUrl) + '/models/{model}:generateContent'
+				: String(targetBaseUrl).replace(/\/+$/, '') + '/chat/completions',
+			native: nativeMode,
 			truncated,
 			results
 		}), { headers: { 'Content-Type': 'application/json' } });
