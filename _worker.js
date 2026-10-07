@@ -10,7 +10,7 @@
 // ★★ 硬约定：**每次改动 _worker.js 都要把版本号 +1**（日期变了就用新日期、序号归 1）。
 //    格式固定 `YYYY-MM-DD.N`。验证脚本会拦下格式不对的值，但「有没有 +1」只能靠自觉 ——
 //    曾经因为版本号没变，本地/线上分不清哪个是哪版，白排查了一整轮。
-const BUILD_ID = '2026-10-06.66';
+const BUILD_ID = '2026-10-06.67';
 
 // 系统默认密钥自动轮换参数
 const ROTATE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000; // 轮换周期：7 天
@@ -389,7 +389,8 @@ function resolveResetOffset(group) {
 		if (!Number.isFinite(v)) return 0;
 		return Math.max(-840, Math.min(840, Math.round(v)));
 	}
-	const preset = RESET_TZ_PRESETS[key];
+	// 用 hasOwnProperty 取值：避免 key 命中 Object.prototype 成员（constructor/toString…）取到函数
+	const preset = Object.prototype.hasOwnProperty.call(RESET_TZ_PRESETS, key) ? RESET_TZ_PRESETS[key] : null;
 	return preset && preset.offset !== null ? preset.offset : 0;
 }
 
@@ -475,7 +476,7 @@ function describeReset(group) {
 		tz = '自定义 UTC' + (off < 0 ? '-' : '+')
 			+ String(Math.floor(abs / 60)).padStart(2, '0') + ':' + String(abs % 60).padStart(2, '0');
 	} else {
-		const preset = RESET_TZ_PRESETS[key];
+		const preset = Object.prototype.hasOwnProperty.call(RESET_TZ_PRESETS, key) ? RESET_TZ_PRESETS[key] : null;
 		tz = preset ? preset.label : 'UTC';
 	}
 	return period + ' ' + time + ' · ' + tz;
@@ -1457,7 +1458,8 @@ function withUsageTap(stream, onUsage) {
 		},
 		cancel(reason) {
 			try { reader.cancel(reason); } catch (e) { }
-			try { onUsage(maxTotal); } catch (e) { }
+			// 回调必须与 start 尾部的形状一致（对象），否则调用方读 uo.tokens 恒为 undefined → 中断的流 token 记 0
+			try { onUsage({ tokens: maxTotal, reasoningTokens: maxReasoning }); } catch (e) { }
 		},
 	});
 }
@@ -2331,10 +2333,13 @@ async function resolveRoute(model, env, sessionKey) {
 		};
 	}
 
-	// 2. 映射表命中。账号池关闭时不合并 CF 预设映射，避免 CF 预设名字劫持第三方模型
-	const combinedMap = cfEnabled
-		? { ...DEFAULT_MODEL_MAP, ...config.customModelMap }
-		: { ...config.customModelMap };
+	// 2. 映射表命中。账号池关闭时不合并 CF 预设映射，避免 CF 预设名字劫持第三方模型。
+	// 用「null 原型」对象：否则当 requested 命中 Object.prototype 成员（toString / constructor /
+	// __proto__ / hasOwnProperty …）时会取到函数/对象而非 undefined，随后 mapped.startsWith 抛
+	// TypeError（未捕获 → 500），违反「未知模型一律显式 400」的约定。
+	const combinedMap = Object.assign(Object.create(null),
+		cfEnabled ? DEFAULT_MODEL_MAP : null,
+		config.customModelMap || {});
 	let mapped = combinedMap[requested];
 
 	// 兼容老写法：内置表已统一叫 cf/<短名>，客户端填的裸短名（glm-4.7-flash）继续认
@@ -3832,6 +3837,10 @@ async function handleDashboardApi(request, env, ctx) {
 				const newKey = (typeof body.key === 'string' && body.key.trim()) ? body.key.trim() : genApiKey();
 				config.systemApiKey = newKey;
 				config.systemApiKeyCreatedAt = new Date().toISOString();
+				// 手动更换 = 立即切换：重置轮换计时（否则旧 systemKeyRotatedAt 若已超期，
+				// 下一次 ensureSystemKey 会把刚设的密钥立刻再轮换一次），并清掉旧密钥宽限期。
+				config.systemKeyRotatedAt = Date.now();
+				config.systemApiKeyPrev = null;
 				await saveAppConfig(env, config);
 				return new Response(JSON.stringify({ success: true, key: newKey }), { headers: { 'Content-Type': 'application/json' } });
 			}
