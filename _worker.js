@@ -10,7 +10,7 @@
 // ★★ 硬约定：**每次改动 _worker.js 都要把版本号 +1**（日期变了就用新日期、序号归 1）。
 //    格式固定 `YYYY-MM-DD.N`。验证脚本会拦下格式不对的值，但「有没有 +1」只能靠自觉 ——
 //    曾经因为版本号没变，本地/线上分不清哪个是哪版，白排查了一整轮。
-const BUILD_ID = '2026-10-06.68';
+const BUILD_ID = '2026-10-06.82';
 
 // 系统默认密钥自动轮换参数
 const ROTATE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000; // 轮换周期：7 天
@@ -230,11 +230,11 @@ async function getAppConfig(env) {
 				systemApiKeyCreatedAt: data.systemApiKeyCreatedAt || null
 			};
 		} catch (e) { }
-	} else {
-		// 仅在 KV 首次初始化时写入默认模型映射，避免覆盖已有配置。
-		parsed.customModelMap = { ...DEFAULT_MODEL_MAP };
-		await env.KV.put('config', JSON.stringify(parsed));
 	}
+	// ⚠️ KV 读不到 config 时**绝不回写**：以前这里会 put 一份默认配置做「首次初始化」，
+	// 但那意味着一次瞬时读空（KV 最终一致 / 抖动）就会把整份配置（渠道 / 密钥 / 配额组）
+	// 覆盖成默认 —— 损失极大。默认配置本就是 parsed 的初值，直接返回即可；
+	// 真正的落盘交给首次 saveAppConfig（如 ensureSystemKey 生成系统密钥时）。
 
 	memoryCache.config = parsed;
 	memoryCache.configExpiry = now + CACHE_TTL_MS;
@@ -579,12 +579,72 @@ async function getCooldowns(env) {
 		const raw = env.KV ? await env.KV.get(COOLDOWN_KV_KEY) : null;
 		if (raw) map = JSON.parse(raw) || {};
 	} catch (e) { map = {}; }
+	// 把「因落盘节流还没写进 KV」的条目并回来：否则每次 KV 重读（缓存过期）都会把它们抹掉，
+	// 节流就从「少写几次」变成「丢冷却」。只并这些条目 —— 其它语义（如管理员手动清空）不受影响。
+	if (cooldownWrite.unpersisted.size && cooldownCache.map) {
+		for (const k of cooldownWrite.unpersisted) {
+			const lv = cooldownCache.map[k];
+			if (lv) map[k] = lv;
+		}
+	}
 	// 顺手清掉已过期的，免得这个键无限膨胀
 	for (const k of Object.keys(map)) {
 		if (!(Number(map[k] && map[k].until) > now)) delete map[k];
 	}
 	cooldownCache = { at: now, map };
 	return map;
+}
+
+// cooldowns 的 KV 落盘节流。
+// 背景：KV 免费档只有 1000 写/天，而上游**每次失败**都会把整张冷却表落盘一次 ——
+// 上游故障 + 客户端重连重试时，这个键会被瞬间刷爆（同一键还额外受平台「1 写/秒」限制）。
+// 但**同一 isolate 内的冷却判定用的是内存 map**（cooldownCache），KV 落盘只为「跨 isolate / 重启后仍可见」，
+// 所以突发时少落几次盘几乎没有代价：本次该跳过谁，照样跳过。
+// 规则：① 两次落盘至少间隔 COOLDOWN_KV_MIN_MS；
+//      ② COOLDOWN_KV_WINDOW_MS 窗口内新增冷却达到 COOLDOWN_KV_BURST_N 次 → 暂停落盘 COOLDOWN_KV_PAUSE_MS
+//         （暂停期间内存照常生效，暂停结束后由下一次状态变更补写一次最新状态）。
+// 整体可用 env.COOLDOWN_KV_THROTTLE=0 关闭（验证脚本断言「每次失败都落盘」时会关掉）。
+const COOLDOWN_KV_MIN_MS = 3000;
+const COOLDOWN_KV_WINDOW_MS = 15000;
+const COOLDOWN_KV_BURST_N = 3;
+const COOLDOWN_KV_PAUSE_MS = 120000;
+const cooldownWrite = { lastAt: 0, winStart: 0, winFails: 0, pausedUntil: 0, unpersisted: new Set() };
+
+function cooldownKvThrottleOn(env) {
+	const v = env && env.COOLDOWN_KV_THROTTLE;
+	if (v === undefined || v === null || v === '') return true;
+	return !(v === 0 || v === '0' || v === false || v === 'false');
+}
+
+// 记一次「新增冷却」（= 一次上游失败），够密就进入暂停
+function noteCooldownFailure() {
+	const now = Date.now();
+	if (now - cooldownWrite.winStart > COOLDOWN_KV_WINDOW_MS) {
+		cooldownWrite.winStart = now;
+		cooldownWrite.winFails = 0;
+	}
+	cooldownWrite.winFails++;
+	if (cooldownWrite.winFails >= COOLDOWN_KV_BURST_N) {
+		cooldownWrite.pausedUntil = now + COOLDOWN_KV_PAUSE_MS;
+		cooldownWrite.winStart = now;
+		cooldownWrite.winFails = 0;
+	}
+}
+
+// 落盘。force=true 跳过节流 —— 只有 clearCooldown 会用它：它仅在真有条目时才走到这里，本身就低频且有界。
+async function persistCooldowns(env, map, force) {
+	if (!env.KV) return false;
+	const now = Date.now();
+	if (!force && cooldownKvThrottleOn(env)) {
+		if (now < cooldownWrite.pausedUntil) return false;                  // 暂停中
+		if (now - cooldownWrite.lastAt < COOLDOWN_KV_MIN_MS) return false;   // 间隔太近
+	}
+	try {
+		await env.KV.put(COOLDOWN_KV_KEY, JSON.stringify(map));
+		cooldownWrite.lastAt = now;
+		cooldownWrite.unpersisted.clear();   // 整张表已落盘，之前的「未落盘」标记不再需要
+		return true;
+	} catch (e) { return false; }   // 冷却落盘失败不影响主流程
 }
 
 async function setCooldown(env, providerId, model, ms, reason) {
@@ -596,9 +656,11 @@ async function setCooldown(env, providerId, model, ms, reason) {
 	if (prev && Number(prev.until) > until) return prev;
 	map[key] = { until, reason: String(reason || '').slice(0, 120) };
 	cooldownCache = { at: Date.now(), map };
-	if (env.KV) {
-		try { await env.KV.put(COOLDOWN_KV_KEY, JSON.stringify(map)); } catch (e) { /* 冷却落盘失败不影响主流程 */ }
-	}
+	// 标记「可能被节流挡住不落盘」的条目：getCooldowns 在 KV 重读时会把它们并回来，
+	// 否则一次缓存过期就把刚设的冷却凭空抹掉 —— 节流会变成「丢冷却」。
+	cooldownWrite.unpersisted.add(key);
+	noteCooldownFailure();
+	await persistCooldowns(env, map);
 	return map[key];
 }
 
@@ -607,10 +669,10 @@ async function clearCooldown(env, providerId, model) {
 	const map = await getCooldowns(env);
 	if (!map[key]) return false;
 	delete map[key];
+	cooldownWrite.unpersisted.delete(key);
 	cooldownCache = { at: Date.now(), map };
-	if (env.KV) {
-		try { await env.KV.put(COOLDOWN_KV_KEY, JSON.stringify(map)); } catch (e) { /* 忽略 */ }
-	}
+	// force：解除冷却不节流（有条目才会走到这里，天然低频；且它是「故障恢复」的信号，应当立刻可见）
+	await persistCooldowns(env, map, true);
 	return true;
 }
 
@@ -822,28 +884,108 @@ async function saveRuntimeSettings(env, { cfPoolEnabled, defaultProviderId }) {
 // ----------------------------------------------------
 // 管理员身份验证（同时支持 Cookie 和 Authorization 请求头）
 // ----------------------------------------------------
-async function checkAdminAuth(request, env) {
-	// 1. 先从 Cookie 里取登录令牌（浏览器访问时走这里）
-	const cookies = request.headers.get('Cookie') || '';
-	const cookieMatch = cookies.match(/admin_token=([^;]+)/);
-	let token = cookieMatch ? cookieMatch[1] : null;
+// 登录令牌 = "<sha256(管理员密码)>.<过期时间戳>"。
+// 配合「会话 cookie」（不设 Max-Age）→ 关浏览器即失效；令牌再自带 1 小时上限，
+// 即使浏览器一直开着，超过 1 小时也会强制重新登录。
+// 旧的「裸哈希」cookie（无有效期）一律视为过期 → 强制重新登录。
+const ADMIN_SESSION_TTL_MS = 60 * 60 * 1000; // 最长登录有效期：1 小时
 
-	// 2. Cookie 里没有的话，再从 Authorization 请求头里取（API 工具调用时走这里）
-	if (!token) {
-		const authHeader = request.headers.get('Authorization');
-		if (authHeader && authHeader.startsWith('Bearer ')) {
-			token = authHeader.substring(7);
+function makeAdminSessionToken(hash) {
+	return hash + '.' + (Date.now() + ADMIN_SESSION_TTL_MS);
+}
+
+// 解析会话令牌：返回 { hash, exp }；格式不对（含旧的无有效期格式）返回 null
+function parseAdminSessionToken(token) {
+	if (typeof token !== 'string' || !token) return null;
+	const i = token.lastIndexOf('.');
+	if (i < 0) return null;
+	const hash = token.slice(0, i);
+	const exp = Number(token.slice(i + 1));
+	if (!hash || !Number.isFinite(exp)) return null;
+	return { hash, exp };
+}
+
+// 管理员凭据。可选环境变量 ADMIN_USERNAME：设置后登录需**同时**填对用户名+密码，
+// 穷举要同时命中两个秘密，破解成本大幅上升；未设置则退回「仅密码」（向后兼容）。
+function adminCredentials(env) {
+	const password = env && env.ADMIN_PASSWORD ? String(env.ADMIN_PASSWORD).trim() : '';
+	const username = env && env.ADMIN_USERNAME ? String(env.ADMIN_USERNAME).trim() : '';
+	return { username, password, requireUsername: !!username };
+}
+
+// 会话令牌的哈希源：配了用户名就纳入 → 改用户名或密码任一都会让旧登录态失效
+async function adminTokenHash(env) {
+	const { username, password } = adminCredentials(env);
+	return sha256(username ? (username + ':' + password) : password);
+}
+
+// ----------------------------------------------------
+// 登录失败限流（isolate 内存 + 冷却）
+// ----------------------------------------------------
+// 说明：仅本 isolate 生效 —— 单个/少量来源的穷举会被直接锁死；分布式来源理论上可绕过，
+// 但那已远超个人网关的威胁模型，且正常用户几乎无感（错几次等一会儿即可）。
+const LOGIN_MAX_FAILS = 5;               // 窗口内失败达到该次数 → 锁定
+const LOGIN_WINDOW_MS = 10 * 60 * 1000;  // 失败计数窗口：10 分钟
+const LOGIN_LOCK_MS = 5 * 60 * 1000;     // 锁定时长：5 分钟
+const loginFailures = new Map();         // ip -> { count, firstAt, until }
+
+function clientIpOf(request) {
+	const ip = request.headers.get('CF-Connecting-IP')
+		|| request.headers.get('X-Forwarded-For')
+		|| 'unknown';
+	return String(ip).split(',')[0].trim() || 'unknown';
+}
+
+function loginLockLeft(ip) {
+	const rec = loginFailures.get(ip);
+	if (!rec || !rec.until) return 0;
+	const left = rec.until - Date.now();
+	return left > 0 ? left : 0;
+}
+
+function noteLoginFailure(ip) {
+	const now = Date.now();
+	let rec = loginFailures.get(ip);
+	if (!rec || (now - rec.firstAt) > LOGIN_WINDOW_MS) rec = { count: 0, firstAt: now, until: 0 };
+	rec.count++;
+	if (rec.count >= LOGIN_MAX_FAILS) rec.until = now + LOGIN_LOCK_MS;
+	loginFailures.set(ip, rec);
+	// 防内存膨胀：条目过多时清掉已过期/已过窗口的
+	if (loginFailures.size > 5000) {
+		for (const [k, v] of loginFailures) {
+			if ((!v.until || now >= v.until) && (now - v.firstAt) > LOGIN_WINDOW_MS) loginFailures.delete(k);
 		}
 	}
+}
 
-	if (!token) return false;
+function clearLoginFailures(ip) {
+	loginFailures.delete(ip);
+}
 
-	const expectedPassword = env.ADMIN_PASSWORD ? env.ADMIN_PASSWORD.trim() : '';
+async function checkAdminAuth(request, env) {
+	const cred = adminCredentials(env);
+	if (!cred.password) return false; // 还没配置管理员密码
+	const expectedHash = await adminTokenHash(env);
 
-	if (!expectedPassword) return false; // 还没配置管理员密码
+	// 1. 先从 Cookie 里取登录令牌（浏览器访问时走这里）—— 必须带有效期且未过期
+	const cookies = request.headers.get('Cookie') || '';
+	const cookieMatch = cookies.match(/admin_token=([^;]+)/);
+	if (cookieMatch) {
+		const parsed = parseAdminSessionToken(cookieMatch[1]);
+		return !!parsed && parsed.hash === expectedHash && Date.now() < parsed.exp;
+	}
 
-	const expectedHash = await sha256(expectedPassword);
-	return token === expectedHash;
+	// 2. Cookie 里没有的话，再从 Authorization 请求头里取（API 工具调用时走这里）
+	//    裸哈希保持兼容（脚本/工具直传）；若带有效期则一并校验
+	const authHeader = request.headers.get('Authorization');
+	if (authHeader && authHeader.startsWith('Bearer ')) {
+		const raw = authHeader.substring(7).trim();
+		const parsed = parseAdminSessionToken(raw);
+		if (parsed) return parsed.hash === expectedHash && Date.now() < parsed.exp;
+		return raw === expectedHash;
+	}
+
+	return false;
 }
 
 // 校验管理员的登录 Cookie（用于页面访问的权限判断）
@@ -852,13 +994,12 @@ async function verifyAdminCookie(request, env) {
 	const cookieMatch = cookies.match(/admin_token=([^;]+)/);
 	if (!cookieMatch) return false;
 
-	const token = cookieMatch[1];
+	const cred = adminCredentials(env);
+	if (!cred.password) return false;
 
-	const expectedPassword = env.ADMIN_PASSWORD ? env.ADMIN_PASSWORD.trim() : '';
-	if (!expectedPassword) return false;
-
-	const expectedHash = await sha256(expectedPassword);
-	return token === expectedHash;
+	const expectedHash = await adminTokenHash(env);
+	const parsed = parseAdminSessionToken(cookieMatch[1]);
+	return !!parsed && parsed.hash === expectedHash && Date.now() < parsed.exp;
 }
 
 // ----------------------------------------------------
@@ -1125,8 +1266,11 @@ async function handleV1Proxy(request, env, ctx) {
 		} else {
 			combinedMap = {};
 			for (const key of Object.keys(customMap)) {
-				if (typeof customMap[key] === 'string' && !customMap[key].startsWith('@cf/')) {
-					combinedMap[key] = customMap[key];
+				const target = customMap[key];
+				// 账号池关闭时，`@cf/...` 与 `cf/<短名>` 两种写法都不可用（resolveRoute 会直接 400），
+				// 一律不列 —— 否则模型列表会「广告」出调不通的模型（列表里显示 cloudflare、实际调用报错）。
+				if (typeof target === 'string' && !target.startsWith('@cf/') && !target.startsWith('cf/')) {
+					combinedMap[key] = target;
 				}
 			}
 		}
@@ -1148,14 +1292,80 @@ async function handleV1Proxy(request, env, ctx) {
 			const ch = target.startsWith('provider:') ? target.slice('provider:'.length).split('/')[0] : target.split('/')[0];
 			return ch || 'unknown';
 		};
-		const modelsData = Object.keys(combinedMap)
-			.filter(id => !isLegacyPresetAlias(id, combinedMap[id]))
-			.map(id => ({
+		// 规格解析：把「调用名」映射回 (渠道, 上游模型名)，好去缓存里取规格。CF 模型没有规格来源，返回 null。
+		const providersById = new Map(providers.map(p => [p.id, p]));
+		const specTargetOf = (target) => {
+			if (typeof target !== 'string') return null;
+			const t = target.trim();
+			if (t.startsWith('@cf/') || t.startsWith('cf/')) return null;
+			if (t.startsWith('TT:')) {
+				const g = (config.quotaGroups || []).find(x => x.name === t.slice(3).trim());
+				if (!g) return null;
+				const members = g.members || [];
+				const mem = members.find(x => x.status !== 'disabled') || members[0];
+				if (!mem) return null;
+				const p = providersById.get(mem.providerId);
+				return p ? { provider: p, model: mem.model } : null;
+			}
+			const parsed = parseMappingTarget(t, providers);
+			if (!parsed) return null;
+			const p = providersById.get(parsed.providerId);
+			return p ? { provider: p, model: parsed.model } : null;
+		};
+
+		// 从缓存读某渠道某模型的规格（尚未预热到则 null）
+		const specOf = (provider, model) => {
+			const hit = modelInfoCache.get('models:' + provider.id);
+			const details = hit && hit.data && hit.data.details;
+			if (!Array.isArray(details)) return null;
+			const want = String(model).toLowerCase();
+			return details.find(d => String(d.id).toLowerCase() === want) || null;
+		};
+
+		// 把规格摊平成 OpenRouter 风格字段（客户端认哪个用哪个；不认识的字段会被忽略，无害）。
+		// 上游不提供价格时回落到渠道「手填单价」，换算成 美元/token 与 OpenRouter 口径一致。
+		const specFieldsOf = (spec, provider) => {
+			const out = {};
+			if (spec) {
+				if (spec.name) out.name = spec.name;
+				if (spec.description) out.description = spec.description;
+				if (spec.contextLength) { out.context_length = spec.contextLength; out.max_input_tokens = spec.contextLength; }
+				if (spec.maxOutput) {
+					out.max_output_tokens = spec.maxOutput;
+					out.top_provider = { max_completion_tokens: spec.maxOutput };
+				}
+				if (spec.inputModalities || spec.outputModalities) {
+					out.architecture = {};
+					if (spec.inputModalities) out.architecture.input_modalities = spec.inputModalities;
+					if (spec.outputModalities) out.architecture.output_modalities = spec.outputModalities;
+				}
+				if (spec.supportedParameters) out.supported_parameters = spec.supportedParameters;
+				if (spec.pricing && typeof spec.pricing === 'object') out.pricing = spec.pricing;
+			}
+			if (!out.pricing && provider && provider.pricing) {
+				const prompt = (Number(provider.pricing.inputPer1M) || 0) / 1000000;
+				const completion = (Number(provider.pricing.outputPer1M) || 0) / 1000000;
+				if (prompt || completion) out.pricing = { prompt, completion };
+			}
+			return out;
+		};
+
+		const modelsData = [];
+		const providersToWarm = [];
+		const pushModel = (id, ownedBy, st) => {
+			modelsData.push(Object.assign({
 				id,
 				object: 'model',
 				created: 1686935000,
-				owned_by: ownedByOf(combinedMap[id])
-			}));
+				owned_by: ownedBy
+			}, specFieldsOf(st ? specOf(st.provider, st.model) : null, st ? st.provider : null)));
+			if (st) providersToWarm.push(st.provider);
+		};
+
+		for (const id of Object.keys(combinedMap)) {
+			if (isLegacyPresetAlias(id, combinedMap[id])) continue;
+			pushModel(id, ownedByOf(combinedMap[id]), specTargetOf(combinedMap[id]));
+		}
 
 		// 第三方渠道的模型也一并暴露，id 用「渠道名/模型名」形式，可直接拿来调用
 		const knownIds = new Set(Object.keys(combinedMap));
@@ -1164,12 +1374,7 @@ async function handleV1Proxy(request, env, ctx) {
 				const id = `${provider.name}/${m}`;
 				if (!m || knownIds.has(id)) continue;
 				knownIds.add(id);
-				modelsData.push({
-					id,
-					object: 'model',
-					created: 1686935000,
-					owned_by: provider.name
-				});
+				pushModel(id, provider.name, { provider, model: m });
 			}
 		}
 
@@ -1177,12 +1382,15 @@ async function handleV1Proxy(request, env, ctx) {
 		for (const g of config.quotaGroups || []) {
 			if (g.status === 'disabled' || !g.name || knownIds.has('TT:' + g.name)) continue;
 			knownIds.add('TT:' + g.name);
-		modelsData.push({
-			id: 'TT:' + g.name,
-			object: 'model',
-				created: 1686935000,
-				owned_by: 'quota-group'
-			});
+			pushModel('TT:' + g.name, 'quota-group', specTargetOf('TT:' + g.name));
+		}
+
+		// 给本次列出、但缓存缺失/过期的渠道丢一次后台预热（不阻塞本次响应；没 waitUntil 就跳过）
+		const warmed = new Set();
+		for (const p of providersToWarm) {
+			if (warmed.has(p.id)) continue;
+			warmed.add(p.id);
+			warmProviderSpecs(p, ctx);
 		}
 
 		return new Response(JSON.stringify({
@@ -1223,6 +1431,9 @@ async function callAccountPool(cfPayload, env, stream) {
 
 	const shuffledAccounts = [...activeAccounts].sort(() => Math.random() - 0.5);
 	let lastError = null;
+	// 上游 HTTP 状态：4xx 要原样透出（CF 只替换 5xx 响应体），同时供调用方的失败分类使用
+	// —— 以前这里完全不回状态，客户端把 CF 的 400/404 一律看成 502，也无法区分「该不该换账号重试」。
+	let lastStatus = 0;
 
 	for (const account of shuffledAccounts) {
 		// 只对「拿到响应头」设超时，一拿到就撤销 —— 流式开始后可以慢慢流。
@@ -1265,6 +1476,7 @@ async function callAccountPool(cfPayload, env, stream) {
 				}
 			} else {
 				const errorText = await cfResponse.text();
+				lastStatus = cfResponse.status;
 				lastError = `CF API returned ${cfResponse.status}: ${errorText}`;
 			}
 		} catch (e) {
@@ -1274,7 +1486,12 @@ async function callAccountPool(cfPayload, env, stream) {
 		}
 	}
 
-	return { success: false, error: `All Cloudflare accounts failed. Last error: ${lastError}` };
+	return {
+		success: false,
+		error: `All Cloudflare accounts failed. Last error: ${lastError}`,
+		upstreamStatus: lastStatus || 0,
+		status: (lastStatus >= 400 && lastStatus < 500) ? lastStatus : 502
+	};
 }
 
 // 第三方渠道调用：上游必须是 OpenAI 兼容端点，响应格式与 CF 一致，可直接透传
@@ -1299,6 +1516,8 @@ const STATS_TABLE_SQL = `CREATE TABLE IF NOT EXISTS stats (
 	probe_ms_total INTEGER NOT NULL DEFAULT 0,
 	tokens INTEGER NOT NULL DEFAULT 0,
 	reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+	input_tokens INTEGER NOT NULL DEFAULT 0,
+	output_tokens INTEGER NOT NULL DEFAULT 0,
 	last_ms INTEGER NOT NULL DEFAULT 0,
 	last_at TEXT,
 	PRIMARY KEY (day, provider_id, model)
@@ -1323,6 +1542,9 @@ async function ensureStatsTable(env) {
 			['probe_ms_total', 'INTEGER NOT NULL DEFAULT 0'],
 			['tokens', 'INTEGER NOT NULL DEFAULT 0'],
 			['reasoning_tokens', 'INTEGER NOT NULL DEFAULT 0'],
+			// 成本估算要按输入/输出各自单价算，故分开存（老数据为 0 → 成本侧自动回落粗估）
+			['input_tokens', 'INTEGER NOT NULL DEFAULT 0'],
+			['output_tokens', 'INTEGER NOT NULL DEFAULT 0'],
 			['last_ms', 'INTEGER NOT NULL DEFAULT 0'],
 			['last_at', 'TEXT']
 		]) {
@@ -1342,7 +1564,7 @@ async function ensureStatsTable(env) {
 //   - 失败只丢这一条计数，绝不影响代理本身
 // isProbe = true 表示这是「测试连通 / 测模型」这类探测调用 —— 单独计数（probe_*），
 // 但配额判断会把两者相加，因为上游是按总请求数算额度的，测试同样消耗它。
-function recordProviderCall(env, ctx, provider, model, ok, ms, isProbe, tokens, reasoningTokens) {
+function recordProviderCall(env, ctx, provider, model, ok, ms, isProbe, tokens, reasoningTokens, inputTokens, outputTokens) {
 	if (!env.DB) return;
 	// 桶是「小时」而不是「天」：配额组的重置时刻可以不在 UTC 零点（如 Gemini 是太平洋午夜
 	// = UTC 07:00），只有小时级的桶才能把周期边界切准。列名仍叫 day（SQLite 改主键成本高），
@@ -1352,14 +1574,17 @@ function recordProviderCall(env, ctx, provider, model, ok, ms, isProbe, tokens, 
 	const msRounded = Math.max(0, Math.round(Number(ms) || 0));
 	const tokensRounded = Math.max(0, Math.round(Number(tokens) || 0));
 	const reasoningRounded = Math.max(0, Math.round(Number(reasoningTokens) || 0));
+	const inputRounded = Math.max(0, Math.round(Number(inputTokens) || 0));
+	const outputRounded = Math.max(0, Math.round(Number(outputTokens) || 0));
 	const task = (async () => {
 		await ensureStatsTable(env);
 		await env.DB.prepare(
 			`INSERT INTO stats (day, provider_id, provider_name, model,
 			                    req, ok, fail, ms_total,
 			                    probe_req, probe_ok, probe_fail, probe_ms_total, tokens, reasoning_tokens,
+			                    input_tokens, output_tokens,
 			                    last_ms, last_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(day, provider_id, model) DO UPDATE SET
 			   provider_name = excluded.provider_name,
 			   req = req + excluded.req,
@@ -1372,6 +1597,8 @@ function recordProviderCall(env, ctx, provider, model, ok, ms, isProbe, tokens, 
 			   probe_ms_total = probe_ms_total + excluded.probe_ms_total,
 			   tokens = tokens + excluded.tokens,
 			   reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens,
+			   input_tokens = input_tokens + excluded.input_tokens,
+			   output_tokens = output_tokens + excluded.output_tokens,
 			   last_ms = CASE WHEN (excluded.ok = 1 OR excluded.probe_ok = 1) THEN excluded.last_ms ELSE last_ms END,
 			   last_at = CASE WHEN (excluded.ok = 1 OR excluded.probe_ok = 1) THEN excluded.last_at ELSE last_at END`
 		).bind(
@@ -1389,6 +1616,8 @@ function recordProviderCall(env, ctx, provider, model, ok, ms, isProbe, tokens, 
 			probe ? msRounded : 0,
 			probe ? 0 : tokensRounded,
 			probe ? 0 : reasoningRounded,
+			probe ? 0 : inputRounded,
+			probe ? 0 : outputRounded,
 			// 最近一次 = 覆盖写：转发和探测都算（后台「重测」的延迟要能立刻反映到看板）
 			msRounded,
 			new Date().toISOString()
@@ -1404,13 +1633,16 @@ function recordProviderCall(env, ctx, provider, model, ok, ms, isProbe, tokens, 
 //   Gemini 原生   → 由 geminiResponseToOpenAI 直接塞进 usage.reasoning_tokens
 function usageOf(result) {
 	const u = result && result.data && result.data.usage;
-	if (!u) return { tokens: 0, reasoningTokens: 0 };
+	if (!u) return { tokens: 0, reasoningTokens: 0, inputTokens: 0, outputTokens: 0 };
 	const tokens = Number(u.total_tokens || u.totalTokens || 0) || 0;
 	let reasoning = 0;
 	if (u.reasoning_tokens) reasoning = Number(u.reasoning_tokens) || 0;
 	else if (u.completion_tokens_details && u.completion_tokens_details.reasoning_tokens) reasoning = Number(u.completion_tokens_details.reasoning_tokens) || 0;
 	else if (u.output_tokens_details && u.output_tokens_details.reasoning_tokens) reasoning = Number(u.output_tokens_details.reasoning_tokens) || 0;
-	return { tokens, reasoningTokens: reasoning };
+	// 输入/输出分开记（成本估算按各自单价算）；缺字段留 0，成本侧自动回落粗估
+	const inputTokens = Number(u.prompt_tokens || u.input_tokens || 0) || 0;
+	const outputTokens = Number(u.completion_tokens || u.output_tokens || 0) || 0;
+	return { tokens, reasoningTokens: reasoning, inputTokens, outputTokens };
 }
 
 // 流式响应探针：只旁路观察，**不改动任何字节**。
@@ -1422,6 +1654,8 @@ function withUsageTap(stream, onUsage) {
 	let buf = '';
 	let maxTotal = 0;
 	let maxReasoning = 0;
+	let maxInput = 0;
+	let maxOutput = 0;
 	return new ReadableStream({
 		// 铁律：Worker 上必须 start 主动排空，绝不用裸 pull（见 MEMORY.md 流式约定）
 		start(controller) {
@@ -1443,6 +1677,10 @@ function withUsageTap(stream, onUsage) {
 								if (m) maxTotal = Math.max(maxTotal, Number(m[1]) || 0);
 								const mr = /"reasoning_tokens"\s*:\s*(\d+)/.exec(s);
 								if (mr) maxReasoning = Math.max(maxReasoning, Number(mr[1]) || 0);
+								const mi = /"prompt_tokens"\s*:\s*(\d+)/.exec(s);
+								if (mi) maxInput = Math.max(maxInput, Number(mi[1]) || 0);
+								const mo = /"completion_tokens"\s*:\s*(\d+)/.exec(s);
+								if (mo) maxOutput = Math.max(maxOutput, Number(mo[1]) || 0);
 							}
 							if (buf.length > 200000) buf = buf.slice(-4096); // 防异常上游把缓冲撑爆
 						} catch (e) { /* 探测失败不影响转发 */ }
@@ -1452,14 +1690,14 @@ function withUsageTap(stream, onUsage) {
 				} catch (e) {
 					try { controller.error(e); } catch (_) { }
 				} finally {
-					try { onUsage({ tokens: maxTotal, reasoningTokens: maxReasoning }); } catch (e) { /* 统计失败绝不影响请求 */ }
+					try { onUsage({ tokens: maxTotal, reasoningTokens: maxReasoning, inputTokens: maxInput, outputTokens: maxOutput }); } catch (e) { /* 统计失败绝不影响请求 */ }
 				}
 			})();
 		},
 		cancel(reason) {
 			try { reader.cancel(reason); } catch (e) { }
 			// 回调必须与 start 尾部的形状一致（对象），否则调用方读 uo.tokens 恒为 undefined → 中断的流 token 记 0
-			try { onUsage({ tokens: maxTotal, reasoningTokens: maxReasoning }); } catch (e) { }
+			try { onUsage({ tokens: maxTotal, reasoningTokens: maxReasoning, inputTokens: maxInput, outputTokens: maxOutput }); } catch (e) { }
 		},
 	});
 }
@@ -1476,6 +1714,41 @@ async function queryProviderStats(env, range) {
 	// 想更准就按渠道/模型配价；这里只做 Token 级粗估，可用环境变量 THIRD_PARTY_EST_COST_PER_1K 覆盖。
 	const estRate = Number(env && env.THIRD_PARTY_EST_COST_PER_1K) || 0.011;
 
+	// 单价来源优先级：① 渠道手填单价 → ② 上游 /models 缓存里的真实价（OpenRouter 等）→ ③ 全局粗估 estRate。
+	// 手填价让 Gemini / Agnes 这类上游不公开价格的渠道也能算得比较准。
+	const providersForPricing = await getProviders(env);
+	const manualPriceOf = (pid) => {
+		const p = (providersForPricing || []).find(x => x.id === String(pid));
+		const pr = p && p.pricing;
+		if (pr && (Number(pr.inputPer1M) > 0 || Number(pr.outputPer1M) > 0)) {
+			return { inputPer1M: Number(pr.inputPer1M) || 0, outputPer1M: Number(pr.outputPer1M) || 0 };
+		}
+		return null;
+	};
+	const upstreamPriceOf = (pid, model) => {
+		const hit = modelInfoCache.get('models:' + String(pid));
+		const details = hit && hit.data && hit.data.details;
+		if (!Array.isArray(details)) return null;
+		const d = details.find(x => x.id === String(model));
+		if (!d || !d.pricing) return null;
+		// 上游 pricing 是「美元 / token」（OpenRouter 风格），换算成 /百万 tokens
+		const inputPer1M = (Number(d.pricing.prompt) || 0) * 1000000;
+		const outputPer1M = (Number(d.pricing.completion) || 0) * 1000000;
+		if (!inputPer1M && !outputPer1M) return null;
+		return { inputPer1M, outputPer1M };
+	};
+	// 有单价且这行有入/出拆分 → 按各自单价精确算；否则（无价 / 老数据没拆）沿用原来的「总 token × 粗估」
+	const costOf = (pid, model, o) => {
+		const inputTokens = Number(o.inputTokens) || 0;
+		const outputTokens = Number(o.outputTokens) || 0;
+		const total = Number(o.tokens) || 0;
+		const price = manualPriceOf(pid) || upstreamPriceOf(pid, model);
+		if (price && (inputTokens + outputTokens) > 0) {
+			return Math.round((inputTokens / 1000000 * price.inputPer1M + outputTokens / 1000000 * price.outputPer1M) * 100) / 100;
+		}
+		return Math.round(total / 1000 * estRate * 100) / 100;
+	};
+
 	const today = new Date().toISOString().slice(0, 10);
 	let sinceDay = null;
 	if (range === 'today') sinceDay = today;
@@ -1486,13 +1759,13 @@ async function queryProviderStats(env, range) {
 	const run = (stmt) => (sinceDay ? stmt.bind(...args) : stmt).all();
 
 	const totalsStmt = env.DB.prepare(
-		'SELECT COALESCE(SUM(req),0) AS req, COALESCE(SUM(ok),0) AS ok, COALESCE(SUM(fail),0) AS fail, COALESCE(SUM(ms_total),0) AS msTotal, COALESCE(SUM(probe_req),0) AS probeReq, COALESCE(SUM(probe_ok),0) AS probeOk, COALESCE(SUM(probe_fail),0) AS probeFail, COALESCE(SUM(probe_ms_total),0) AS probeMsTotal, COALESCE(SUM(tokens),0) AS tokens, COALESCE(SUM(reasoning_tokens),0) AS reasoningTokens FROM stats ' + where
+		'SELECT COALESCE(SUM(req),0) AS req, COALESCE(SUM(ok),0) AS ok, COALESCE(SUM(fail),0) AS fail, COALESCE(SUM(ms_total),0) AS msTotal, COALESCE(SUM(probe_req),0) AS probeReq, COALESCE(SUM(probe_ok),0) AS probeOk, COALESCE(SUM(probe_fail),0) AS probeFail, COALESCE(SUM(probe_ms_total),0) AS probeMsTotal, COALESCE(SUM(tokens),0) AS tokens, COALESCE(SUM(reasoning_tokens),0) AS reasoningTokens, COALESCE(SUM(input_tokens),0) AS inputTokens, COALESCE(SUM(output_tokens),0) AS outputTokens FROM stats ' + where
 	);
 	const totalsRow = (await run(totalsStmt)).results?.[0] || {};
 
 	const rowsStmt = env.DB.prepare(
 		// MAX(last_at) + 裸列 last_ms：SQLite 规定裸列取自 MAX 命中的那一行 —— 即拿到「最近一次」的延迟
-		'SELECT provider_id, provider_name, model, SUM(req) AS req, SUM(ok) AS ok, SUM(fail) AS fail, SUM(ms_total) AS msTotal, SUM(probe_req) AS probeReq, SUM(probe_ok) AS probeOk, SUM(probe_fail) AS probeFail, SUM(probe_ms_total) AS probeMsTotal, SUM(tokens) AS tokens, SUM(reasoning_tokens) AS reasoningTokens, MAX(last_at) AS lastAt, last_ms AS lastMs FROM stats ' + where + ' GROUP BY provider_id, model ORDER BY req DESC'
+		'SELECT provider_id, provider_name, model, SUM(req) AS req, SUM(ok) AS ok, SUM(fail) AS fail, SUM(ms_total) AS msTotal, SUM(probe_req) AS probeReq, SUM(probe_ok) AS probeOk, SUM(probe_fail) AS probeFail, SUM(probe_ms_total) AS probeMsTotal, SUM(tokens) AS tokens, SUM(reasoning_tokens) AS reasoningTokens, SUM(input_tokens) AS inputTokens, SUM(output_tokens) AS outputTokens, MAX(last_at) AS lastAt, last_ms AS lastMs FROM stats ' + where + ' GROUP BY provider_id, model ORDER BY req DESC'
 	);
 	const rows = (await run(rowsStmt)).results || [];
 
@@ -1520,7 +1793,7 @@ async function queryProviderStats(env, range) {
 	for (const r of rows) {
 		const key = String(r.provider_id);
 		if (!byProvider.has(key)) {
-			byProvider.set(key, { id: key, name: r.provider_name, req: 0, ok: 0, fail: 0, msTotal: 0, probeReq: 0, probeOk: 0, probeFail: 0, probeMsTotal: 0, tokens: 0, reasoningTokens: 0, models: [] });
+			byProvider.set(key, { id: key, name: r.provider_name, req: 0, ok: 0, fail: 0, msTotal: 0, probeReq: 0, probeOk: 0, probeFail: 0, probeMsTotal: 0, tokens: 0, reasoningTokens: 0, inputTokens: 0, outputTokens: 0, costEst: 0, models: [] });
 		}
 		const p = byProvider.get(key);
 		p.req += r.req || 0;
@@ -1533,9 +1806,14 @@ async function queryProviderStats(env, range) {
 		p.probeMsTotal += r.probeMsTotal || 0;
 		p.tokens += r.tokens || 0;
 		p.reasoningTokens += r.reasoningTokens || 0;
+		p.inputTokens += r.inputTokens || 0;
+		p.outputTokens += r.outputTokens || 0;
 		// 渠道级「最近一次」= 各模型里时刻最新的那个
 		if (r.lastAt && (!p.lastAt || r.lastAt > p.lastAt)) { p.lastAt = r.lastAt; p.lastMs = r.lastMs || 0; }
 		if (r.provider_name) p.name = r.provider_name;
+		// 成本按「模型」逐条算（单价是模型级的），渠道成本 = 各模型成本之和
+		const modelCost = costOf(r.provider_id, r.model, r);
+		p.costEst += modelCost;
 		p.models.push({
 			model: r.model,
 			// 与 shape 同口径：请求数/成功失败/平均延迟并入探测（.47）
@@ -1547,7 +1825,9 @@ async function queryProviderStats(env, range) {
 			lastAt: r.lastAt || null,
 			tokens: r.tokens || 0,
 			reasoningTokens: r.reasoningTokens || 0,
-			costEst: Math.round((r.tokens || 0) / 1000 * estRate * 100) / 100,
+			inputTokens: r.inputTokens || 0,
+			outputTokens: r.outputTokens || 0,
+			costEst: modelCost,
 			probeReq: r.probeReq || 0,
 			probeOk: r.probeOk || 0,
 			probeFail: r.probeFail || 0,
@@ -1555,7 +1835,7 @@ async function queryProviderStats(env, range) {
 		});
 	}
 
-	const shape = (o) => ({
+	const shape = (o, costOverride) => ({
 		// req/ok/fail/avgMs 已并入探测调用（probe_*），与配额面板、占比环形图口径一致（.47）
 		req: (o.req || 0) + (o.probeReq || 0),
 		ok: (o.ok || 0) + (o.probeOk || 0),
@@ -1564,20 +1844,25 @@ async function queryProviderStats(env, range) {
 		avgMs: ((o.req || 0) + (o.probeReq || 0)) ? Math.round(((o.msTotal || 0) + (o.probeMsTotal || 0)) / ((o.req || 0) + (o.probeReq || 0))) : 0,
 		tokens: o.tokens || 0,
 		reasoningTokens: o.reasoningTokens || 0,
-		costEst: Math.round((o.tokens || 0) / 1000 * estRate * 100) / 100,
+		inputTokens: o.inputTokens || 0,
+		outputTokens: o.outputTokens || 0,
+		costEst: costOverride != null ? costOverride : Math.round((o.tokens || 0) / 1000 * estRate * 100) / 100,
 		probeReq: o.probeReq || 0,
 		probeOk: o.probeOk || 0,
 		probeFail: o.probeFail || 0,
 		probeAvgMs: o.probeReq ? Math.round((o.probeMsTotal || 0) / o.probeReq) : 0
 	});
 
+	const providerList = [...byProvider.values()];
+	const totalCostEst = Math.round(providerList.reduce((s, p) => s + (p.costEst || 0), 0) * 100) / 100;
+
 	return {
 		enabled: true,
 		range,
 		sinceDay,
 		today,
-		summary: shape(totalsRow),
-		providers: [...byProvider.values()].map(p => ({ id: p.id, name: p.name, ...shape(p), lastMs: p.lastMs || 0, lastAt: p.lastAt || null, models: p.models })),
+		summary: shape(totalsRow, totalCostEst),
+		providers: providerList.map(p => ({ id: p.id, name: p.name, ...shape(p, p.costEst), lastMs: p.lastMs || 0, lastAt: p.lastAt || null, models: p.models })),
 		trend: {
 			days: dayList,
 			series: [...trendByModel.entries()].map(([model, byDay]) => ({ model, data: dayList.map(d => byDay[d] || 0) }))
@@ -1700,6 +1985,9 @@ function openaiContentToParts(content) {
 			if (p.type === 'image_url' && p.image_url && typeof p.image_url.url === 'string') {
 				const m = /^data:([^;]+);base64,(.+)$/i.exec(p.image_url.url);
 				if (m) parts.push({ inlineData: { mimeType: m[1], data: m[2] } });
+				// 非 data URI 的图片 URL（http(s)://…）在这里被有意跳过：Gemini 原生只接受
+				// inlineData 或经 Files API 上传得到的 fileData.fileUri，**不能**直抓任意公网
+				// 图片地址。硬转 fileData 只会让上游 400，所以保持丢弃（不发坏请求）。
 			}
 		}
 		return parts.length ? parts : [{ text: '' }];
@@ -2180,23 +2468,32 @@ async function callUpstream(route, payload, env, stream, ctx) {
 		tried.add(memberKey);
 		inflightInc(memberKey);
 		const startedAt = Date.now();
-		const r = await callProvider(curProvider, preparePayload(curProvider, curModel), stream);
-		inflightDec(memberKey);
+		let r;
+		try {
+			r = await callProvider(curProvider, preparePayload(curProvider, curModel), stream);
+		} finally {
+			// 用 finally 保证 inc/dec 配平：入参表达式若同步抛错，旧写法会跳过 dec → 在途计数永久 +1
+			inflightDec(memberKey);
+		}
 		const elapsed = Date.now() - startedAt;
 
 		if (r.success) {
-			// 成功 → 顺手解除该成员的冷却（可能只是偶发抖动）
-			if (route.quotaGroupId && sched) await clearCooldown(env, curProvider.id, curModel);
+			// 成功 → 解除该成员的冷却（可能只是偶发抖动）。
+			// ⚠️ 必须与下面「失败即写冷却」对称：以前这里只对**配额组**路由清、而写冷却却对
+			// **所有**路由生效，于是一条直连请求的偶发失败会给该成员留下冷却、之后直连成功也
+			// 解不掉；若该成员同时被某配额组引用，就会被 pickQuotaMember 静默跳过。
+			// clearCooldown 查不到条目时是空操作，且共用 isolate 冷却缓存，不会给每次成功都加 KV 写。
+			if (sched) await clearCooldown(env, curProvider.id, curModel);
 			// 延迟统一记 TTFB（首字节），流式/非流式口径一致（见 callProvider/callGeminiNative/callAccountPool）
 			const okMs = (r.ttfb != null) ? r.ttfb : elapsed;
 			if (stream && r.stream) {
 				// 流式：token 要等流走完才知道，交给探针在结束时落库
 				r.stream = withUsageTap(r.stream, (uo) => {
-					recordProviderCall(env, ctx, curProvider, curModel, true, okMs, false, uo.tokens, uo.reasoningTokens);
+					recordProviderCall(env, ctx, curProvider, curModel, true, okMs, false, uo.tokens, uo.reasoningTokens, uo.inputTokens, uo.outputTokens);
 				});
 			} else {
 				const uo = usageOf(r);
-				recordProviderCall(env, ctx, curProvider, curModel, true, okMs, false, uo.tokens, uo.reasoningTokens);
+				recordProviderCall(env, ctx, curProvider, curModel, true, okMs, false, uo.tokens, uo.reasoningTokens, uo.inputTokens, uo.outputTokens);
 			}
 			result = r;
 			break;
@@ -2485,6 +2782,9 @@ async function handleCompletions(request, env, pathname, ctx) {
 		'logprobs', 'top_logprobs', 'seed', 'user',
 		'tools', 'tool_choice', 'parallel_tool_calls',
 		'response_format',
+		// 以下几项以前被静默丢弃：新模型用 max_completion_tokens 取代 max_tokens、
+		// 推理模型用 reasoning_effort、少数上游用 logit_bias —— 客户端发了却收不到会很难排查。
+		'max_completion_tokens', 'reasoning_effort', 'logit_bias',
 	];
 	for (const field of passthroughFields) {
 		if (body[field] !== undefined) cfPayload[field] = body[field];
@@ -2608,7 +2908,9 @@ function convertAnthropicToOpenAI(anthropicBody) {
 					}
 				}
 
-				const assistantMsg = { role: 'assistant', content: textContent || null };
+				// 只有确实带 tool_calls 时才允许 content: null（OpenAI 的合法形态）；
+				// 否则空内容会产出「content: null 且无 tool_calls」的非法消息。
+				const assistantMsg = { role: 'assistant', content: textContent || (toolCalls.length > 0 ? null : '') };
 				if (toolCalls.length > 0) {
 					assistantMsg.tool_calls = toolCalls;
 				}
@@ -2688,7 +2990,9 @@ function convertAnthropicToOpenAI(anthropicBody) {
 	// 确保第一条消息是 user（OpenAI 要求第一条消息必须是 user 或 system）
 	// 如果第一条是 assistant（来自 Anthropic 的多轮 tool calling），在它前面插入一条占位 user 消息
 	const firstNonSystemMsg = openaiMessages.find(m => m.role !== 'system');
-	if (firstNonSystemMsg && firstNonSystemMsg.role === 'assistant') {
+	// 首条只要不是 user 就补占位：除了 assistant（多轮 tool calling），首条 user 消息**只含
+	// tool_result** 时会转出 role:'tool'，形成 system→tool 开头，部分上游直接 400。
+	if (firstNonSystemMsg && firstNonSystemMsg.role !== 'user') {
 		// 找到 system 消息后的位置，插入一条空的 user 消息
 		const systemCount = openaiMessages.filter(m => m.role === 'system').length;
 		openaiMessages.splice(systemCount, 0, {
@@ -2793,11 +3097,20 @@ function convertOpenAIToAnthropic(openaiResponse, originalModel) {
 // ----------------------------------------------------
 // OpenAI 错误响应 → Anthropic 错误格式转换
 // ----------------------------------------------------
-function convertOpenAIErrorToAnthropic(openaiError) {
+function convertOpenAIErrorToAnthropic(openaiError, status) {
+	// 按上游 HTTP 状态码映射 Anthropic 错误类型：以前恒为 api_error，会把 400 这类
+	// 客户端自身的错误标成服务端错误，误导客户端的重试策略。
+	const s = Number(status) || 0;
+	let type = 'api_error';
+	if (s === 400 || s === 404 || s === 422) type = 'invalid_request_error';
+	else if (s === 401) type = 'authentication_error';
+	else if (s === 403) type = 'permission_error';
+	else if (s === 429) type = 'rate_limit_error';
+	else if (s === 413) type = 'request_too_large';
 	return {
 		type: 'error',
 		error: {
-			type: 'api_error',
+			type,
 			message: openaiError?.error?.message || openaiError?.message || 'Unknown error'
 		}
 	};
@@ -2859,7 +3172,8 @@ async function handleMessages(request, env, ctx) {
 
 		const status = result.status || 502;
 		const anthropicError = convertOpenAIErrorToAnthropic(
-			errorDetail || { message: result.error }
+			errorDetail || { message: result.error },
+			status
 		);
 		return new Response(JSON.stringify(anthropicError), {
 			status,
@@ -2869,7 +3183,7 @@ async function handleMessages(request, env, ctx) {
 
 	if (stream) {
 		// 流式：转换流
-		const transformedStream = withSseHeartbeat(anthropicStreamTransform(result.stream, model, anthropicBody.messages));
+		const transformedStream = withSseHeartbeat(anthropicStreamTransform(result.stream, model));
 		return new Response(transformedStream, {
 			headers: {
 				'Content-Type': 'text/event-stream',
@@ -2895,7 +3209,7 @@ async function handleMessages(request, env, ctx) {
 // Anthropic SSE 流式转换
 // 将 OpenAI SSE 格式实时转换为 Anthropic SSE 格式
 // ----------------------------------------------------
-function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
+function anthropicStreamTransform(upstreamBody, modelName) {
 	const reader = upstreamBody.getReader();
 	const decoder = new TextDecoder();
 	const encoder = new TextEncoder();
@@ -2909,6 +3223,8 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 	let blockStopSent = false;  // 跟踪最后一个 content block 是否已发送 stop（Bug #2）
 	let inputTokens = 0;
 	let outputTokens = 0;
+	let finalFinish = '';       // 上游最后一个 finish_reason（把 length 映射成 max_tokens，与非流式口径一致）
+	let finalSent = false;      // 收尾事件是否已发（[DONE] 或流自然结束 → 只发一次）
 
 	return new ReadableStream({
 		// ⚠️ 主动排空（eager drain），理由同 passthroughStream：
@@ -2922,6 +3238,12 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 							if (buffer.trim()) {
 								buffer = processLines(buffer, controller);
 							}
+							// ⚠️ 关键兜底：不少上游**根本不发 `data: [DONE]`**（尤其 Gemini 原生路径，
+							// 见 geminiStreamToOpenAI：它刻意不产 [DONE]，补 [DONE] 的 passthroughStream
+							// 只挂在 OpenAI 路径上）。以前只认 [DONE] 才收尾 → 这类上游走 /v1/messages
+							// 时客户端永远等不到 message_delta / message_stop → SDK 报「流在 message_stop
+							// 前结束」或直接挂起。故流自然结束时若无收尾，必须补发。
+							if (!finalSent) sendFinalEvent(controller);
 							controller.close();
 							break;
 						}
@@ -2962,16 +3284,20 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 
 				try {
 					const chunk = JSON.parse(dataStr);
-					const choice = chunk.choices?.[0];
-					if (!choice) continue;
 
-					const delta = choice.delta || {};
-
-					// 更新 usage
+					// ⚠️ usage 必须**先于** choices 判定处理：OpenAI 规范里 stream_options.include_usage
+					// 的 usage 放在最后一个 `choices: []` 的包里（本代理在 callProvider 里强制要了该参数，
+					// geminiStreamToOpenAI 也这么发）——先 `if (!choice) continue` 会整包丢掉，
+					// 导致 message_delta.usage 里的 input/output tokens 恒为 0。
 					if (chunk.usage) {
 						inputTokens = chunk.usage.prompt_tokens || 0;
 						outputTokens = chunk.usage.completion_tokens || 0;
 					}
+
+					const choice = chunk.choices?.[0];
+					if (!choice) continue;
+
+					const delta = choice.delta || {};
 
 					// 处理 tool_calls delta
 					if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
@@ -2983,9 +3309,11 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 
 						for (const tc of delta.tool_calls) {
 							if (tc.id) {
-								// 新的 tool_call 开始
-								if (currentToolCallId) {
-									// 先结束上一个
+								// 新的 tool_call 开始。**任何**已打开但未关闭的内容块都要先收掉 ——
+								// 不能只判断「上一个工具块」：若此刻开着的是文本块（index 0），直接就
+								// contentBlockIndex++ 到 1 并 content_block_start，会发出非法的 SSE 序列
+								// （index 0 永远没有 content_block_stop）。反向 tool→text 已有对称处理。
+								if (!blockStopSent && contentBlockIndex >= 0) {
 									sendContentBlockStop(controller);
 									blockStopSent = true;
 								}
@@ -3033,8 +3361,9 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 
 					// 检查 finish_reason
 					if (choice.finish_reason) {
+						finalFinish = choice.finish_reason;
 						if (currentToolCallId && currentToolArgs) {
-							// 发送最终的 tool_use input
+							// 发送最终的 tool_use input（内部会置 blockStopSent，避免收尾时重复发）
 							sendToolUseFinalInput(controller);
 						}
 					}
@@ -3109,15 +3438,26 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 	}
 
 	function sendFinalEvent(controller) {
-		// 如果 finish_reason 触发时已发送过 content_block_stop，跳过重复发送（Bug #2）
-		if (!blockStopSent) {
-			sendContentBlockStop(controller);
+		if (finalSent) return;   // 只发一次（[DONE] 与「流自然结束」两条路径都会调到这里）
+		finalSent = true;
+
+		// 整条流没有任何内容块（空回复 / 上游只回 usage）时，必须先补 message_start，
+		// 否则会先发 message_delta / message_stop —— 协议顺序非法，客户端会直接报错。
+		if (!streamStarted) {
+			sendMessageStart(controller);
+			streamStarted = true;
 		}
 
-		let stopReason = 'end_turn';
-		if (currentToolCallId) {
-			stopReason = 'tool_use';
+		// 有内容块且尚未收尾 → 补 content_block_stop；无内容块时 contentBlockIndex 为 -1，不能发（index:-1 非法）
+		if (!blockStopSent && contentBlockIndex >= 0) {
+			sendContentBlockStop(controller);
+			blockStopSent = true;
 		}
+
+		// stop_reason 与非流式 convertOpenAIToAnthropic 对齐：length→max_tokens、tool_calls→tool_use
+		let stopReason = 'end_turn';
+		if (finalFinish === 'length') stopReason = 'max_tokens';
+		else if (finalFinish === 'tool_calls' || currentToolCallId) stopReason = 'tool_use';
 
 		const event = {
 			type: 'message_delta',
@@ -3125,7 +3465,9 @@ function anthropicStreamTransform(upstreamBody, modelName, originalMessages) {
 				stop_reason: stopReason,
 				stop_sequence: null
 			},
-			usage: { output_tokens: outputTokens || 0 }
+			// usage 在流末尾才拿得到，故 message_start 里的 input_tokens 只能是 0；
+			// 这里补上真实的 input/output，避免客户端看到的输入 token 恒为 0。
+			usage: { input_tokens: inputTokens || 0, output_tokens: outputTokens || 0 }
 		};
 		controller.enqueue(encoder.encode(`event: message_delta\ndata: ${JSON.stringify(event)}\n\n`));
 
@@ -3354,6 +3696,152 @@ function buildProviderTestHint(status, baseUrl, errText, model, native = false) 
 	return '';
 }
 
+// ----------------------------------------------------
+// 模型规格元信息（上下文窗口 / 最大输出 / 价格 / 能力）
+// 不同上游 /models 的字段名各不相同，这里归一化成统一视图：
+//   OpenRouter 风格：context_length / pricing / architecture.input_modalities / top_provider.max_completion_tokens
+//   Google 原生风格：inputTokenLimit / outputTokenLimit / displayName / supportedGenerationMethods
+//   通用 OpenAI 风格：多数只回 id（拿不到的字段一律留空，前端显示「—」）
+// ----------------------------------------------------
+const MODEL_INFO_CACHE_MS = 5 * 60 * 1000;
+const modelInfoCache = new Map(); // providerId -> { at, data }
+
+function firstVal(...vals) {
+	for (const v of vals) if (v !== undefined && v !== null && v !== '') return v;
+	return undefined;
+}
+function numOrNull(v) {
+	const n = Number(v);
+	return Number.isFinite(n) && n > 0 ? n : null;
+}
+// 渠道自定义单价（美元 / 百万 tokens）。undefined = 本次未提交（编辑时保留原值）；null = 清空；对象 = 设置。
+function sanitizeProviderPricing(raw) {
+	if (raw === undefined) return undefined;
+	if (!raw || typeof raw !== 'object') return null;
+	const num = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : 0; };
+	const inputPer1M = num(raw.inputPer1M);
+	const outputPer1M = num(raw.outputPer1M);
+	if (!inputPer1M && !outputPer1M) return null;
+	return { inputPer1M, outputPer1M };
+}
+function normalizeModelSpec(m) {
+	if (typeof m === 'string') {
+		return {
+			id: m.replace(/^models\//, '').trim(), name: '', description: '',
+			contextLength: null, maxOutput: null, pricing: null,
+			inputModalities: null, outputModalities: null, supportedParameters: null, supportedMethods: null
+		};
+	}
+	if (!m || typeof m !== 'object') return null;
+	const arch = (m.architecture && typeof m.architecture === 'object') ? m.architecture : {};
+	const tp = (m.top_provider && typeof m.top_provider === 'object') ? m.top_provider : {};
+	const pricing = (m.pricing && typeof m.pricing === 'object') ? m.pricing : null;
+	const id = String(firstVal(m.id, m.name, m.model) || '').replace(/^models\//, '').trim();
+	if (!id) return null;
+	const displayName = firstVal(m.displayName, m.display_name);
+	return {
+		id,
+		name: displayName ? String(displayName) : ((typeof m.name === 'string' && m.name !== id) ? m.name : ''),
+		description: String(firstVal(m.description) || ''),
+		contextLength: numOrNull(firstVal(m.context_length, m.contextLength, m.inputTokenLimit, m.input_token_limit, tp.context_length, m.context_window)),
+		maxOutput: numOrNull(firstVal(tp.max_completion_tokens, m.max_completion_tokens, m.max_output_tokens, m.outputTokenLimit, m.output_token_limit)),
+		pricing,
+		inputModalities: Array.isArray(arch.input_modalities) ? arch.input_modalities : (Array.isArray(m.input_modalities) ? m.input_modalities : null),
+		outputModalities: Array.isArray(arch.output_modalities) ? arch.output_modalities : null,
+		supportedParameters: Array.isArray(m.supported_parameters) ? m.supported_parameters : null,
+		supportedMethods: Array.isArray(m.supportedGenerationMethods) ? m.supportedGenerationMethods : null
+	};
+}
+
+// Gemini 原生 /models —— OpenAI 兼容层只回 id，原生才有 inputTokenLimit / outputTokenLimit / displayName。
+// 失败静默返回 null：它只是「补充」，不该让整个拉取失败。
+async function fetchGeminiNativeModels(provider) {
+	const base = geminiNativeBase(provider.baseUrl);
+	if (!base) return null;
+	try {
+		const res = await fetch(base + '/models', {
+			headers: { 'x-goog-api-key': provider.apiKey || '' },
+			signal: AbortSignal.timeout(20000)
+		});
+		if (!res.ok) return null;
+		const data = await res.json().catch(() => null);
+		const list = Array.isArray(data && data.models) ? data.models : [];
+		return list.map(normalizeModelSpec).filter(d => d && d.id);
+	} catch (e) { return null; }
+}
+
+// 拉取并归一化某渠道的模型规格（打上游 {baseUrl}/models，Gemini 再补一手原生 /models）。
+// 两处共用：后台「模型规格」弹窗（要详细错误）与 /v1/models 的后台预热（只看成败）。
+// 返回 { ok:true, payload } 或 { ok:false, ...失败细节 }；成功时由调用方写入 modelInfoCache。
+async function buildModelSpecPayload(provider) {
+	const baseUrl = String(provider.baseUrl || '').replace(/\/+$/, '');
+	const headers = { 'Content-Type': 'application/json' };
+	if (provider.apiKey) headers['Authorization'] = `Bearer ${provider.apiKey}`;
+	const endpoint = baseUrl + '/models';
+
+	try {
+		const res = await fetch(endpoint, { method: 'GET', headers, signal: AbortSignal.timeout(20000) });
+		if (!res.ok) {
+			const errText = await res.text();
+			return { ok: false, endpoint, status: res.status, errText };
+		}
+
+		const data = await res.json().catch(() => null);
+		const rawList = Array.isArray(data?.data) ? data.data
+			: Array.isArray(data?.models) ? data.models
+				: Array.isArray(data) ? data : [];
+
+		// 归一化每个模型的规格（各家字段名不同，统一成一套；拿不到的留空）
+		const details = rawList.map(normalizeModelSpec).filter(d => d && d.id);
+		const models = details.map(d => d.id);
+
+		// Gemini 渠道再补一手原生 /models：OpenAI 兼容层只回 id，原生才有 inputTokenLimit / outputTokenLimit 等
+		if (isGeminiProvider(provider)) {
+			const native = await fetchGeminiNativeModels(provider);
+			if (Array.isArray(native) && native.length) {
+				const byId = new Map();
+				for (const d of details) byId.set(d.id.toLowerCase(), d);
+				for (const n of native) {
+					const base = byId.get(n.id.toLowerCase());
+					if (base) {
+						// 只补兼容层缺的字段，不覆盖已有值
+						for (const k of Object.keys(n)) {
+							if ((base[k] === undefined || base[k] === null || base[k] === '') && n[k] !== undefined && n[k] !== null) base[k] = n[k];
+						}
+					} else {
+						details.push(n);
+						models.push(n.id);
+					}
+				}
+			}
+		}
+
+		return { ok: true, payload: { success: true, endpoint, count: models.length, models, details } };
+	} catch (e) {
+		return { ok: false, endpoint, transport: true, error: `连接失败: ${e.message}` };
+	}
+}
+
+// /v1/models 的后台预热：把渠道规格悄悄拉进 modelInfoCache。
+// ① 只在有 ctx.waitUntil 时执行 —— 响应已经发出，绝不让客户端等上游；
+// ② 已有新鲜缓存则跳过；③ 同一渠道在缓存窗口内最多尝试一次，避免上游故障时被反复打。
+const modelSpecWarmAt = new Map(); // providerId -> 上次预热尝试时间
+function warmProviderSpecs(provider, ctx) {
+	if (!ctx || typeof ctx.waitUntil !== 'function') return;
+	const key = 'models:' + provider.id;
+	const hit = modelInfoCache.get(key);
+	if (hit && Date.now() - hit.at < MODEL_INFO_CACHE_MS) return;
+	const last = modelSpecWarmAt.get(provider.id) || 0;
+	if (Date.now() - last < MODEL_INFO_CACHE_MS) return;
+	modelSpecWarmAt.set(provider.id, Date.now());
+
+	const task = (async () => {
+		const result = await buildModelSpecPayload(provider);
+		if (result.ok) modelInfoCache.set(key, { at: Date.now(), data: result.payload });
+	})().catch(() => { });
+	ctx.waitUntil(task);
+}
+
 
 // 透传 CF /ai/v1/chat/completions 返回的 SSE 流
 // CF 返回的本来就是标准 OpenAI 的 SSE 格式，我们只把模型名改一下，
@@ -3495,8 +3983,10 @@ async function handleDashboardApi(request, env, ctx) {
 
 	// 1. 查询初始化状态（密码通过环境变量配置，所以这里永远返回已初始化）
 	if (url.pathname === '/api/auth/status' && method === 'GET') {
+		const cred = adminCredentials(env);
 		return new Response(JSON.stringify({
-			isSetup: true
+			isSetup: true,
+			requireUsername: cred.requireUsername
 		}), { headers: { 'Content-Type': 'application/json' } });
 	}
 
@@ -3505,21 +3995,39 @@ async function handleDashboardApi(request, env, ctx) {
 		return new Response(JSON.stringify({ error: 'Setup is handled via environment variable ADMIN_PASSWORD' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 	}
 
-	// 3. 登录（直接比对密码，不读写 KV，既快又省钱）
+	// 3. 登录（直接比对凭据，不读写 KV，既快又省钱）
 	if (url.pathname === '/api/auth/login' && method === 'POST') {
-		const { password } = await request.json();
-		const expectedPassword = env.ADMIN_PASSWORD ? env.ADMIN_PASSWORD.trim() : '';
-		if (password === expectedPassword) {
-			const token = await sha256(password);
+		const body = await request.json().catch(() => ({}));
+		const cred = adminCredentials(env);
+		if (!cred.password) {
+			return new Response(JSON.stringify({ error: '管理员密码未配置（需设置环境变量 ADMIN_PASSWORD）' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+		}
+		// 限流：同一来源连续失败过多 → 先锁一段时间
+		const ip = clientIpOf(request);
+		const lockLeft = loginLockLeft(ip);
+		if (lockLeft > 0) {
+			const secs = Math.ceil(lockLeft / 1000);
+			return new Response(JSON.stringify({ error: `尝试过于频繁，请 ${secs} 秒后再试` }), {
+				status: 429,
+				headers: { 'Content-Type': 'application/json', 'Retry-After': String(secs) }
+			});
+		}
+		const okUser = cred.requireUsername ? (String(body.username || '') === cred.username) : true;
+		const okPass = typeof body.password === 'string' && body.password === cred.password;
+		if (okUser && okPass) {
+			clearLoginFailures(ip);
+			// 会话 cookie（不设 Max-Age）→ 关浏览器即登出；1 小时上限由令牌内的 exp 控制
+			const token = makeAdminSessionToken(await adminTokenHash(env));
 			return new Response(JSON.stringify({ success: true }), {
 				headers: {
 					'Content-Type': 'application/json',
-					'Set-Cookie': `admin_token=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400`
+					'Set-Cookie': `admin_token=${token}; Path=/; HttpOnly; SameSite=Strict`
 				}
 			});
-		} else {
-			return new Response(JSON.stringify({ error: 'Incorrect password' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
 		}
+		noteLoginFailure(ip);
+		// 用户名/密码错误一律返回同一句话，避免泄露是哪一项错
+		return new Response(JSON.stringify({ error: cred.requireUsername ? '用户名或密码不正确' : '密码不正确' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
 	}
 
 	// 4. 退出登录
@@ -3960,8 +4468,11 @@ async function handleDashboardApi(request, env, ctx) {
 			}
 			const config = await getAppConfig(env);
 			config.systemKeyRotationEnabled = enabled;
-			// 开启时若还没有起始时间，记录为现在，避免一开启就因 rotatedAt 过旧而立即轮换
-			if (enabled && !config.systemKeyRotatedAt) config.systemKeyRotatedAt = Date.now();
+			// 开启轮换时把轮换起点重置为「现在」，语义统一为「从开启之日起每 N 天轮换」。
+			// 以前只判 `!config.systemKeyRotatedAt`，但 ensureSystemKey 在**首次安装**就会写入它，
+			// 所以那个条件永远不成立 → 装好 7 天后再打开开关，下一次请求就立即轮换一次，
+			// 与本意「避免一开启就立即轮换」相反。
+			if (enabled) config.systemKeyRotatedAt = Date.now();
 			await saveAppConfig(env, config);
 			return new Response(JSON.stringify({ success: true, enabled }), { headers: { 'Content-Type': 'application/json' } });
 		}
@@ -3972,8 +4483,8 @@ async function handleDashboardApi(request, env, ctx) {
 		if (!(await checkAdminAuth(request, env))) {
 			return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
 		}
-		const raw = url.searchParams.get('range') || '7d';
-		const range = ['today', '7d', 'all'].includes(raw) ? raw : '7d';
+		const raw = url.searchParams.get('range') || 'today';
+		const range = ['today', '7d', 'all'].includes(raw) ? raw : 'today';
 		return new Response(JSON.stringify(await queryProviderStats(env, range)), { headers: { 'Content-Type': 'application/json' } });
 	}
 
@@ -4059,7 +4570,10 @@ async function handleDashboardApi(request, env, ctx) {
 		}
 
 		if (method === 'POST') {
-			const { id, name, baseUrl, apiKey, models, status, geminiNative } = await request.json();
+			const body = await request.json();
+			const { id, name, baseUrl, apiKey, models, status, geminiNative } = body;
+			// 渠道自定义单价（美元 / 百万 tokens）；undefined = 未提交、null = 清空、对象 = 设置
+			const pricing = sanitizeProviderPricing(body.pricing);
 			// Gemini 原生协议开关：true = 强制走原生 / false = 强制走旧兼容端点 / 其它(含未传) = 按 baseUrl 自动判断。
 			// 用 undefined 表示「自动」—— saveProviders 走 JSON，undefined 的键会被丢掉，所以老配置零迁移。
 			const gnFlag = geminiNative === true ? true : (geminiNative === false ? false : undefined);
@@ -4105,6 +4619,16 @@ async function handleDashboardApi(request, env, ctx) {
 				geminiNative: gnFlag,
 					createdAt: new Date().toISOString()
 				});
+			}
+
+			// 渠道自定义单价：undefined = 本次未提交（保留原值）；null = 显式清空；对象 = 设置。
+			if (pricing !== undefined) {
+				const targetId = id || (providers[providers.length - 1] || {}).id;
+				const pricingTarget = providers.find(p => p.id === targetId);
+				if (pricingTarget) {
+					if (pricing) pricingTarget.pricing = pricing;
+					else delete pricingTarget.pricing;
+				}
 			}
 
 			await saveProviders(env, providers);
@@ -4229,12 +4753,34 @@ async function handleDashboardApi(request, env, ctx) {
 				return new Response(JSON.stringify({ error: '组名不能带 "TT:" 前缀（调用时已自动添加，直接填自定义组名即可）' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 			}
 
-			const members = (Array.isArray(body.members) ? body.members : []).map(m => ({
-				providerId: String(m.providerId || '').trim(),
-				model: String(m.model || '').trim(),
-				limit: Math.max(0, Math.floor(Number(m.limit) || 0)),
-				status: m.status === 'disabled' ? 'disabled' : 'active'
-			})).filter(m => m.providerId && m.model);
+			// 成员净化：① limit 非空又非数字时**显式报错**（以前 `Number(x)||0` 会把它静默变成
+			// 0 = 「不限次数」）；② 按 (providerId, model) 去重（重复行共享同一用量键，会让调度
+			// 白跑、界面出现重复卡片）。
+			// 注意：**不**拒绝指向已删渠道的成员 —— 那是本项目的既定设计：这类成员在运行时被
+			// pickQuotaMember 跳过，并在配额面板上标「渠道已删除」，让用户自己决定怎么处理。
+			const rawMembers = Array.isArray(body.members) ? body.members : [];
+			const seenMemberKeys = new Set();
+			const members = [];
+			for (const m of rawMembers) {
+				const providerId = String(m.providerId || '').trim();
+				const model = String(m.model || '').trim();
+				if (!providerId || !model) continue;   // 界面新增但未填的行：直接丢弃
+				let limit = 0;
+				const rawLimit = m.limit;
+				if (rawLimit !== undefined && rawLimit !== null && rawLimit !== '') {
+					const n = Number(rawLimit);
+					if (!Number.isFinite(n) || n < 0) {
+						return new Response(JSON.stringify({
+							error: `成员「${model}」的配额上限不是合法数字：${JSON.stringify(rawLimit)}（留空或 0 表示不限次数）`
+						}), { status: 400, headers: { 'Content-Type': 'application/json' } });
+					}
+					limit = Math.floor(n);
+				}
+				const memberKey = providerId + '\u0000' + model;
+				if (seenMemberKeys.has(memberKey)) continue;   // 同渠道同模型只保留第一条
+				seenMemberKeys.add(memberKey);
+				members.push({ providerId, model, limit, status: m.status === 'disabled' ? 'disabled' : 'active' });
+			}
 
 			if (!members.length) {
 				return new Response(JSON.stringify({ error: '至少需要一个有效成员（渠道 + 模型名）' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
@@ -4309,6 +4855,12 @@ async function handleDashboardApi(request, env, ctx) {
 			const body = await request.json().catch(() => ({}));
 			if (body.clearCooldowns === true) {
 				cooldownCache = { at: Date.now(), map: {} };
+				// 管理员手动清空：把落盘节流状态也一并复位，否则接下来几分钟的冷却可能被节流挡住不落盘
+				cooldownWrite.pausedUntil = 0;
+				cooldownWrite.winStart = 0;
+				cooldownWrite.winFails = 0;
+				cooldownWrite.lastAt = 0;
+				cooldownWrite.unpersisted.clear();
 				if (env.KV) { try { await env.KV.delete(COOLDOWN_KV_KEY); } catch (e) { /* 忽略 */ } }
 			}
 			if (body.enabled !== undefined) await saveQuotaScheduling(env, body.enabled !== false);
@@ -4422,47 +4974,37 @@ async function handleDashboardApi(request, env, ctx) {
 			return new Response(JSON.stringify({ success: false, error: 'Provider not found' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
 		}
 
-		const baseUrl = String(provider.baseUrl || '').replace(/\/+$/, '');
-		const headers = { 'Content-Type': 'application/json' };
-		if (provider.apiKey) headers['Authorization'] = `Bearer ${provider.apiKey}`;
-		const endpoint = baseUrl + '/models';
-
-		try {
-			const res = await fetch(endpoint, { method: 'GET', headers, signal: AbortSignal.timeout(20000) });
-			if (!res.ok) {
-				const errText = await res.text();
-				return new Response(JSON.stringify({
-					success: false,
-					endpoint,
-					error: `HTTP ${res.status}: ${errText.slice(0, 300)}`,
-					upstreamMessage: extractUpstreamMessage(errText),
-					hint: '并非所有上游都提供 /models 接口，遇到这种就只能手动填模型名。'
-				}), { headers: { 'Content-Type': 'application/json' } });
+		// 5 分钟进程内缓存：规格元信息不常变，避免反复打开弹窗就反复打上游（?refresh=1 强制刷新）
+		const modelsCacheKey = 'models:' + provider.id;
+		if (url.searchParams.get('refresh') !== '1') {
+			const hit = modelInfoCache.get(modelsCacheKey);
+			if (hit && Date.now() - hit.at < MODEL_INFO_CACHE_MS) {
+				return new Response(JSON.stringify(Object.assign({ cached: true }, hit.data)), { headers: { 'Content-Type': 'application/json' } });
 			}
-
-			const data = await res.json().catch(() => null);
-			let models = [];
-			if (Array.isArray(data?.data)) models = data.data.map(m => m && (m.id || m.name));
-			else if (Array.isArray(data?.models)) models = data.models.map(m => m && (m.name || m.id));
-			else if (Array.isArray(data)) models = data.map(m => (typeof m === 'string' ? m : (m && (m.id || m.name))));
-
-			// 去掉 models/ 前缀，保证是可以直接用于 chat/completions 的裸 ID
-			models = models.map(m => String(m || '').replace(/^models\//, '').trim()).filter(Boolean);
-
-			return new Response(JSON.stringify({
-				success: true,
-				endpoint,
-				count: models.length,
-				models
-			}), { headers: { 'Content-Type': 'application/json' } });
-		} catch (e) {
-			return new Response(JSON.stringify({
-				success: false,
-				endpoint,
-				error: `连接失败: ${e.message}`,
-				hint: '并非所有上游都提供 /models 接口，遇到这种就只能手动填模型名。'
-			}), { headers: { 'Content-Type': 'application/json' } });
 		}
+
+		// 复用统一实现（与 /v1/models 的后台预热同一份代码，避免两处各写一遍）
+		const result = await buildModelSpecPayload(provider);
+		if (!result.ok) {
+			const body = result.transport
+				? {
+					success: false,
+					endpoint: result.endpoint,
+					error: result.error,
+					hint: '并非所有上游都提供 /models 接口，遇到这种就只能手动填模型名。'
+				}
+				: {
+					success: false,
+					endpoint: result.endpoint,
+					error: `HTTP ${result.status}: ${result.errText.slice(0, 300)}`,
+					upstreamMessage: extractUpstreamMessage(result.errText),
+					hint: '并非所有上游都提供 /models 接口，遇到这种就只能手动填模型名。'
+				};
+			return new Response(JSON.stringify(body), { headers: { 'Content-Type': 'application/json' } });
+		}
+
+		modelInfoCache.set(modelsCacheKey, { at: Date.now(), data: result.payload });
+		return new Response(JSON.stringify(result.payload), { headers: { 'Content-Type': 'application/json' } });
 	}
 
 	return new Response(JSON.stringify({ error: 'Endpoint not found' }), { status: 404 });
@@ -4560,6 +5102,8 @@ const COMMON_TOAST_JS = `
 async function handleLandingPage(request, env, ctx) {
 	// ⚠️ 模板里（悬浮按钮 / 登录弹窗）引用了 isLoggedIn，删了这里就会 Error 1101（2026-10-05 踩过）
 	const isLoggedIn = await verifyAdminCookie(request, env);
+	// 配了 ADMIN_USERNAME 时登录框多一个「用户名」；未配置则只显示密码框
+	const requireUsername = adminCredentials(env).requireUsername;
 	// 账号池关闭时首页不显示 CF 用量看板（纯第三方反代模式下那些数字恒为 0）
 	const cfEnabled = await getCfPoolEnabled(env);
 
@@ -5300,9 +5844,14 @@ async function handleLandingPage(request, env, ctx) {
 					<button class="btn btn-secondary" onclick="submitLogout()" style="width: 100%; height: 42px;">安全退出</button>
 				</div>
 			` : `
+				${requireUsername ? `
+				<div class="form-group" style="margin-top: 10px;">
+					<label for="login-username">用户名</label>
+					<input type="text" id="login-username" placeholder="请输入用户名" autocomplete="username" onkeydown="if(event.key==='Enter')submitLogin()">
+				</div>` : ''}
 				<div class="form-group" style="margin-top: 10px;">
 					<label for="login-password">管理员密码</label>
-					<input type="password" id="login-password" placeholder="请输入管理员密码" onkeydown="if(event.key==='Enter')submitLogin()">
+					<input type="password" id="login-password" placeholder="请输入管理员密码" autocomplete="current-password" onkeydown="if(event.key==='Enter')submitLogin()">
 				</div>
 				<div class="modal-footer" style="margin-top: 10px; display: flex; gap: 12px; justify-content: flex-end; width: 100%;">
 					<button class="btn btn-secondary" onclick="closeLoginModal()" style="height: 38px;">取消</button>
@@ -5357,11 +5906,12 @@ async function handleLandingPage(request, env, ctx) {
 
 		function openLoginModal() {
 			document.getElementById('login-modal').classList.add('active');
+			const usrInput = document.getElementById('login-username');
 			const pwdInput = document.getElementById('login-password');
-			if (pwdInput) {
-				pwdInput.value = '';
-				setTimeout(() => pwdInput.focus(), 100);
-			}
+			if (usrInput) usrInput.value = '';
+			if (pwdInput) pwdInput.value = '';
+			const first = usrInput || pwdInput;
+			if (first) setTimeout(() => first.focus(), 100);
 		}
 
 		function closeLoginModal() {
@@ -5382,14 +5932,9 @@ async function handleLandingPage(request, env, ctx) {
 				
 				renderPublicSummary(data);
 
-				// 如果后端认为需要更新，则继续发送 POST 请求触发静默更新并获取最新数据
-				if (data.needUpdate) {
-					const updateRes = await fetch('/api/usage/summary', { method: 'POST' });
-					if (updateRes.ok) {
-						const freshData = await updateRes.json();
-						renderPublicSummary(freshData);
-					}
-				}
+				// 匿名访客不再触发 POST 刷新：该接口已改为必须管理员鉴权（P0 修复 2026-10-05），
+				// 匿名调用只会拿到 401 —— 旧代码在这里白跑一次请求且静默失败。
+				// CF 用量的刷新交给已登录的管理面板。
 			} catch (e) {
 				console.error(e);
 			}
@@ -5561,11 +6106,14 @@ async function handleLandingPage(request, env, ctx) {
 		}
 
 		async function submitLogin() {
-			const password = document.getElementById('login-password').value;
+			const pwdEl = document.getElementById('login-password');
+			const usrEl = document.getElementById('login-username');
+			const password = pwdEl ? pwdEl.value : '';
+			const username = usrEl ? usrEl.value : '';
 			const res = await fetch('/api/auth/login', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ password })
+				body: JSON.stringify({ username, password })
 			});
 			if (res.ok) {
 				showToast('登录成功！跳转中...');
@@ -6916,13 +7464,13 @@ async function handleAdminPage(request, env, ctx) {
 				</div>
 
 				<div class="nav-group-title">路由</div>
-				<div class="nav-item" id="menu-settings" onclick="switchTab('settings')">
-					<svg style="width: 18px; height: 18px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
-					模型映射
-				</div>
 				<div class="nav-item" id="menu-quota" onclick="switchTab('quota')">
 					<svg style="width: 18px; height: 18px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4"></path></svg>
 					调用配额
+				</div>
+				<div class="nav-item" id="menu-settings" onclick="switchTab('settings')">
+					<svg style="width: 18px; height: 18px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+					模型映射
 				</div>
 			</div>
 
@@ -7573,6 +8121,15 @@ async function handleAdminPage(request, env, ctx) {
 					</select>
 				</div>
 
+				<div class="form-group" style="margin-top: 14px;">
+					<label for="provider-price-input">计费单价（可选，用于估算成本）</label>
+					<div style="display: flex; gap: 10px;">
+						<input type="number" id="provider-price-input" step="0.0001" min="0" placeholder="输入价 $/百万 tokens">
+						<input type="number" id="provider-price-output" step="0.0001" min="0" placeholder="输出价 $/百万 tokens">
+					</div>
+					<div class="section-note" style="margin-top: 6px;">留空 = 用上游价（OpenRouter 这类会自动带回）或全局粗估。Gemini / Agnes 这类上游不公开价格，手填后统计看板的「估算成本」更准。</div>
+				</div>
+
 				<div id="provider-test-result" style="display: none;">
 					<div id="provider-test-summary" style="padding: 12px 16px; border-radius: 10px; font-size: 13px; line-height: 1.7; white-space: pre-wrap; word-break: break-word; overflow-wrap: break-word; border: 1px solid transparent;"></div>
 					<details id="provider-test-raw-wrap" style="display: none; margin-top: 10px;">
@@ -7620,6 +8177,27 @@ async function handleAdminPage(request, env, ctx) {
 			<div class="modal-footer">
 				<button class="btn btn-secondary" onclick="closeProviderHealthModal()">关闭</button>
 				<button class="btn btn-success" id="btn-test-all-models" onclick="testAllProviderModels()" title="会消耗上游额度，并计入调用配额">测试全部模型</button>
+			</div>
+		</div>
+	</div>
+
+	<!-- Modal: 模型规格（上游元信息：上下文 / 最大输出 / 价格 / 能力） -->
+	<div class="modal-overlay" id="model-spec-modal">
+		<div class="modal-card" style="max-width: 920px; padding: 24px;">
+			<div class="modal-header">
+				<h3 id="model-spec-title">模型规格</h3>
+				<button onclick="closeModelSpecModal()" style="background: none; border: none; color: var(--text-muted); cursor: pointer;">
+					<svg style="width: 20px; height: 20px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+				</button>
+			</div>
+			<div class="modal-body">
+				<div class="section-note" id="model-spec-endpoint"></div>
+				<div id="model-spec-content" style="max-height: 52vh; overflow: auto;"></div>
+				<div class="section-note" style="margin-top: 10px;">规格来自上游 <code>/models</code> 接口，能否拿到取决于上游。<b>价格仅供参考</b>。<code>—</code> = 上游未提供该字段。</div>
+			</div>
+			<div class="modal-footer">
+				<button class="btn btn-secondary" onclick="closeModelSpecModal()">关闭</button>
+				<button class="btn btn-secondary" id="btn-spec-refresh" onclick="reloadModelSpecs()">重新拉取</button>
 			</div>
 		</div>
 	</div>
@@ -7744,8 +8322,9 @@ async function handleAdminPage(request, env, ctx) {
 		let customMappings = {};
 		let mappingInvalid = {};
 		let mappingCfEnabled = true;
-		// 分组折叠状态：cf=null 表示首次加载还没初始化（按当前模式决定默认是否折叠）
-		const mappingGroupCollapsed = { cf: true, provider: true };
+		// 分组折叠状态：cf=null 表示首次加载还没初始化（loadSettings 里按当前模式决定默认是否折叠，
+		// 之后尊重用户手动展开）；provider 组默认收起。
+		const mappingGroupCollapsed = { cf: null, provider: true };
 		let providersCache = [];
 		let runtimeState = { cfPoolEnabled: true, defaultProviderId: '', accounts: 0 };
 		let healthProviderId = null;
@@ -8026,7 +8605,7 @@ async function handleAdminPage(request, env, ctx) {
 		initTheme();
 
 		// ---------- 第三方渠道调用统计（本代理埋点，与 CF 官方账单是两条独立链路） ----------
-		let statsRange = '7d';
+		let statsRange = 'today';
 
 		function setStatsRange(r) {
 			statsRange = r;
@@ -8280,8 +8859,8 @@ async function handleAdminPage(request, env, ctx) {
 			if (!document.body.classList.contains('cf-off')) {
 				loadUsageDetails();
 			}
-			// 渠道统计两种模式都要加载（CF 段关闭时它仍然有内容）
-			setStatsRange('7d');
+			// 渠道统计两种模式都要加载（CF 段关闭时它仍然有内容）；默认看「今日」
+			setStatsRange('today');
 		};
 
 		function toggleSidebar() {
@@ -8538,16 +9117,20 @@ async function handleAdminPage(request, env, ctx) {
 					const maskedToken = acc.apiToken.length > 8 ? acc.apiToken.substring(0, 4) + '...' + acc.apiToken.substring(acc.apiToken.length - 4) : '********';
 					const tr = document.createElement('tr');
 					tr.innerHTML = \`
-						<td><strong style="font-weight:600;">\${acc.name}</strong></td>
-						<td><code>\${acc.accountId.length > 12 ? acc.accountId.substring(0, 6) + '...' + acc.accountId.substring(acc.accountId.length - 4) : '********'}</code></td>
-						<td><code>\${maskedToken}</code></td>
+						<td><strong style="font-weight:600;">\${sen(acc.name)}</strong></td>
+						<td><code>\${sen(acc.accountId.length > 12 ? acc.accountId.substring(0, 6) + '...' + acc.accountId.substring(acc.accountId.length - 4) : '********')}</code></td>
+						<td><code>\${sen(maskedToken)}</code></td>
 						<td>
 							<div style="display:flex; gap:8px;">
-								<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px;" onclick="editAccount('\${acc.id}', '\${acc.name}', '\${acc.accountId}', '\${acc.apiToken}')">编辑</button>
-								<button class="btn btn-danger" style="padding:6px 12px; font-size:12px; border-radius:6px;" onclick="deleteAccount('\${acc.id}')">删除</button>
+								<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px;" data-acc-edit="\${sen(acc.id)}">编辑</button>
+								<button class="btn btn-danger" style="padding:6px 12px; font-size:12px; border-radius:6px;" data-acc-del="\${sen(acc.id)}">删除</button>
 							</div>
 						</td>
 					\`;
+					// ⚠️ 不再把用户数据拼进内联 onclick（值里含单引号即破坏按钮 JS，含特殊构造还能注入 → 存储型 XSS）。
+					// 改用 data 属性 + 事件绑定；闭包直接捕获 acc，连查表都省了。
+					tr.querySelector('[data-acc-edit]').onclick = () => editAccount(acc);
+					tr.querySelector('[data-acc-del]').onclick = () => deleteAccount(acc.id);
 					tbody.appendChild(tr);
 				});
 			} catch (e) {
@@ -8573,12 +9156,12 @@ async function handleAdminPage(request, env, ctx) {
 			document.getElementById('account-modal').classList.remove('active');
 		}
 
-		function editAccount(id, name, accountId, apiToken) {
+		function editAccount(acc) {
 			document.getElementById('account-modal-title').innerText = '编辑 Cloudflare 账号';
-			document.getElementById('account-id-edit').value = id;
-			document.getElementById('account-name').value = name;
-			document.getElementById('account-id').value = accountId;
-			document.getElementById('account-token').value = apiToken;
+			document.getElementById('account-id-edit').value = acc.id;
+			document.getElementById('account-name').value = acc.name;
+			document.getElementById('account-id').value = acc.accountId;
+			document.getElementById('account-token').value = acc.apiToken;
 			document.getElementById('test-result-alert').style.display = 'none';
 			document.getElementById('perm-wa-read').innerHTML = '';
 			document.getElementById('perm-wa-edit').innerHTML = '';
@@ -8813,7 +9396,7 @@ async function handleAdminPage(request, env, ctx) {
 					<td>
 						<div style="display:flex; align-items:center; gap:8px;">
 							<code id="key-val-\${isSystem ? 'system' : k.id}">\${k.key.length > 6 ? k.key.substring(0, 5) + '...' + k.key.substring(k.key.length - 1) : k.key.substring(0, Math.min(3, k.key.length)) + '...'}</code>
-							<button class="btn btn-secondary" style="padding:4px 8px; font-size:11px; border-radius:6px;" onclick="copyKeyText('\${k.key}')">复制</button>
+							<button class="btn btn-secondary" style="padding:4px 8px; font-size:11px; border-radius:6px;" data-copy="\${sen(k.key)}">复制</button>
 						</div>
 					</td>
 					<td>\${dateStr}</td>
@@ -8829,6 +9412,9 @@ async function handleAdminPage(request, env, ctx) {
 				} else {
 					tr.querySelector('[data-del]').onclick = () => deleteKey(k.id);
 				}
+				// 复制按钮：值经 sen() 转义后放 data 属性（dataset 会自动解码回原文），不用内联 onclick 拼字符串
+				const copyBtn = tr.querySelector('[data-copy]');
+				if (copyBtn) copyBtn.onclick = () => copyKeyText(copyBtn.dataset.copy);
 				tbody.appendChild(tr);
 			});
 			loadRotationState();
@@ -9217,6 +9803,7 @@ async function handleAdminPage(request, env, ctx) {
 						<td>\${statusBadge}</td>
 						<td style="white-space: nowrap;">
 							<button class="btn btn-secondary" style="padding:6px 10px; font-size:12px; border-radius:6px; margin-right:6px;" onclick="openProviderHealthModal('\${p.id}')">测模型</button>
+							<button class="btn btn-secondary" style="padding:6px 10px; font-size:12px; border-radius:6px; margin-right:6px;" onclick="openModelSpecModal('\${p.id}')">模型规格</button>
 							<button class="btn btn-secondary" style="padding:6px 10px; font-size:12px; border-radius:6px; margin-right:6px;" onclick="openProviderModal('\${p.id}')">编辑</button>
 							<button class="btn btn-danger" style="padding:6px 10px; font-size:12px; border-radius:6px;" onclick="deleteProvider('\${p.id}')">删除</button>
 						</td>
@@ -9240,6 +9827,10 @@ async function handleAdminPage(request, env, ctx) {
 			document.getElementById('provider-status').value = p ? (p.status || 'active') : 'active';
 			document.getElementById('provider-gemini-native').value =
 				(p && p.geminiNative === true) ? 'on' : ((p && p.geminiNative === false) ? 'off' : 'auto');
+			document.getElementById('provider-price-input').value =
+				(p && p.pricing && p.pricing.inputPer1M) ? p.pricing.inputPer1M : '';
+			document.getElementById('provider-price-output').value =
+				(p && p.pricing && p.pricing.outputPer1M) ? p.pricing.outputPer1M : '';
 			document.getElementById('provider-modal-title').innerText = p ? '编辑第三方渠道' : '添加第三方渠道';
 			initProviderPresets();
 			document.getElementById('provider-preset').value = '';
@@ -9266,6 +9857,12 @@ async function handleAdminPage(request, env, ctx) {
 				status: document.getElementById('provider-status').value
 			};
 			if (gn !== undefined) payload.geminiNative = gn;
+			// 计费单价：两个都空 → 显式清空（null）；否则下发对象
+			const priceIn = Number(document.getElementById('provider-price-input').value);
+			const priceOut = Number(document.getElementById('provider-price-output').value);
+			const hasIn = isFinite(priceIn) && priceIn > 0;
+			const hasOut = isFinite(priceOut) && priceOut > 0;
+			payload.pricing = (hasIn || hasOut) ? { inputPer1M: hasIn ? priceIn : 0, outputPer1M: hasOut ? priceOut : 0 } : null;
 			return payload;
 		}
 
@@ -9338,6 +9935,147 @@ async function handleAdminPage(request, env, ctx) {
 
 		function closeProviderHealthModal() {
 			document.getElementById('provider-health-modal').classList.remove('active');
+		}
+
+		// ---- 模型规格（上游元信息：上下文 / 最大输出 / 价格 / 能力） ----
+		let specProviderId = '';
+		let specProviderModels = [];
+
+		function fmtTokenCount(n) {
+			if (n === null || n === undefined) return '';
+			n = Number(n);
+			if (!isFinite(n) || n <= 0) return '';
+			if (n >= 1000000) return (n / 1000000).toFixed(n % 1000000 ? 2 : 0) + 'M';
+			if (n >= 1000) return (n / 1000).toFixed(n % 1000 ? 1 : 0) + 'K';
+			return String(n);
+		}
+
+		// OpenRouter 的 pricing 是「美元 / token」的字符串，换算成「/百万 tokens」更好读
+		function fmtModelPrice(pricing) {
+			if (!pricing || typeof pricing !== 'object') return '';
+			const out = [];
+			const pairs = [['prompt', '入'], ['completion', '出']];
+			for (const pair of pairs) {
+				const v = Number(pricing[pair[0]]);
+				if (isFinite(v) && v > 0) {
+					const perM = v * 1000000;
+					out.push(pair[1] + ' $' + (perM < 1 ? perM.toFixed(3) : perM.toFixed(2)));
+				}
+			}
+			return out.length ? out.join(' / ') + ' /M' : '';
+		}
+
+		// 短标签：最多显示 max 个，其余折叠成 +N，鼠标悬停 title 看全 —— 避免长逗号串把列撑爆
+		function specChips(list, max) {
+			if (!Array.isArray(list) || !list.length) return '';
+			// 标签：超长条目（如超长参数名）允许在标签内折行、且不超出列宽（否则 nowrap 会溢出单元格）
+			const chip = 'display:inline-block; max-width:100%; padding:1px 6px; margin:1px 3px 1px 0; border-radius:6px; background: var(--section-item-bg, rgba(148,163,184,0.15)); font-size:11px; overflow-wrap:anywhere;';
+			let html = list.slice(0, max).map(function (s) { return '<span style="' + chip + '">' + sen(String(s)) + '</span>'; }).join('');
+			if (list.length > max) html += '<span style="font-size:11px; color: var(--text-muted);">+' + (list.length - max) + '</span>';
+			return '<span title="' + sen(list.join(', ')) + '">' + html + '</span>';
+		}
+
+		function fmtModelCaps(d) {
+			const lines = [];
+			if (Array.isArray(d.inputModalities) && d.inputModalities.length) lines.push('入：' + specChips(d.inputModalities, 4));
+			if (Array.isArray(d.outputModalities) && d.outputModalities.length) lines.push('出：' + specChips(d.outputModalities, 4));
+			if (Array.isArray(d.supportedParameters) && d.supportedParameters.length) lines.push('参数：' + specChips(d.supportedParameters, 4));
+			if (!lines.length && Array.isArray(d.supportedMethods) && d.supportedMethods.length) lines.push('方法：' + specChips(d.supportedMethods, 2));
+			return lines.join('<br>');
+		}
+
+		// 只列「本渠道已添加的模型」——上游（尤其 OpenRouter）动辄返回几百个，
+		// 全列出来既没用又难找。想看全部就去「编辑」里拉取模型列表。
+		function renderModelSpecs(data) {
+			const box = document.getElementById('model-spec-content');
+			const details = (data && data.details) || [];
+			const byId = new Map();
+			for (const d of details) byId.set(d.id, d);
+			const saved = specProviderModels || [];
+			if (!saved.length) {
+				box.innerHTML = '<div style="text-align:center; color: var(--text-muted); padding: 24px;">这个渠道还没配置模型，先点「编辑」加上</div>';
+				return;
+			}
+			const dash = '<span style="color: var(--text-muted);">—</span>';
+			// 数字列右对齐 + 等宽数字，方便竖向对比
+			const numStyle = 'text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums;';
+			let rows = '';
+			let missing = 0;
+			// ⚠️ 这个 <code> 必须 inline-block：全局 code 样式是 display:inline + padding 4px/8px + border，
+			// 内联元素的上下 padding/border **不撑高行盒**、只会画到行盒外 —— 于是模型 id 的底色和边框
+			// 会压住下一行的显示名（只有带 displayName 的官方模型才会多出那一行，所以看着像「名称重叠」）。
+			// 再加 margin-bottom 与显示名的 margin-top 留出间距。
+			const nameLineStyle = 'font-size:11px; color: var(--text-muted); margin-top: 4px; line-height: 1.4;';
+			for (const id of saved) {
+				const d = byId.get(id);
+				if (!d) missing++;
+				const ctx = d ? fmtTokenCount(d.contextLength) : '';
+				const maxOut = d ? fmtTokenCount(d.maxOutput) : '';
+				const price = d ? fmtModelPrice(d.pricing) : '';
+				const caps = d ? fmtModelCaps(d) : '';
+				rows += '<tr>'
+					+ '<td style="overflow-wrap: anywhere;" title="' + sen(id) + '">'
+					+ '<code style="font-size:12.5px; display:inline-block; max-width:100%; margin-bottom:2px;">' + sen(id) + '</code>'
+					+ (d && d.name && d.name !== d.id ? '<div style="' + nameLineStyle + '">' + sen(d.name) + '</div>' : '')
+					+ (!d ? '<div style="font-size:11px; color: var(--warning-color); margin-top: 4px; line-height: 1.4;">上游未返回该模型（可能已下线或名字不对）</div>' : '')
+					+ '</td>'
+					+ '<td style="' + numStyle + '">' + (ctx || dash) + '</td>'
+					+ '<td style="' + numStyle + '">' + (maxOut || dash) + '</td>'
+					+ '<td style="font-size: 12px; line-height: 1.5;">' + (price ? sen(price) : dash) + '</td>'
+					+ '<td style="font-size: 12px; line-height: 1.9;">' + (caps || dash) + '</td>'
+					+ '</tr>';
+			}
+			// table-layout:fixed + 各列显式宽度 → 不再出现横向滚动条，长内容改为优雅换行
+			// 表头一律 nowrap + 留够宽度（否则「上下文/最大输出」会被单元格内边距挤成两行）
+			box.innerHTML = '<table style="width: 100%; table-layout: fixed;"><thead><tr>'
+				+ '<th style="width: auto; white-space: nowrap;">模型</th>'
+				+ '<th style="width: 96px; text-align: right; white-space: nowrap;">上下文</th>'
+				+ '<th style="width: 104px; text-align: right; white-space: nowrap;">最大输出</th>'
+				+ '<th style="width: 136px; white-space: nowrap;">价格</th>'
+				+ '<th style="width: 30%; white-space: nowrap;">能力 / 参数</th>'
+				+ '</tr></thead><tbody>' + rows + '</tbody></table>'
+				+ '<div class="section-note" style="margin-top: 8px;">只列本渠道已添加的 ' + saved.length + ' 个模型'
+				+ (missing ? '（其中 ' + missing + ' 个上游未返回）' : '')
+				+ '；本次上游共返回 ' + details.length + ' 个。要看全部请到「编辑」里拉取模型列表。</div>';
+		}
+
+		function loadModelSpecs(force) {
+			if (!specProviderId) return;
+			const box = document.getElementById('model-spec-content');
+			box.innerHTML = '<div style="text-align:center; color: var(--text-muted); padding: 24px;">正在从上游拉取…</div>';
+			document.getElementById('model-spec-endpoint').textContent = '';
+			apiFetch('/api/providers/models?id=' + encodeURIComponent(specProviderId) + (force ? '&refresh=1' : ''))
+				.then(r => r.json())
+				.then(data => {
+					if (!data.success) {
+						box.innerHTML = '<div style="color: var(--danger-color); padding: 16px; font-size: 13px;">拉取失败：' + sen(data.error || '') + '</div>';
+						return;
+					}
+					document.getElementById('model-spec-endpoint').textContent =
+						'实际请求地址：' + (data.endpoint || '') + (data.cached ? '（来自缓存）' : '');
+					renderModelSpecs(data);
+				})
+				.catch(e => {
+					box.innerHTML = '<div style="color: var(--danger-color); padding: 16px; font-size: 13px;">请求异常：' + sen(e.message) + '</div>';
+				});
+		}
+
+		function openModelSpecModal(id) {
+			const p = providersCache.find(x => x.id === id);
+			if (!p) return;
+			specProviderId = id;
+			specProviderModels = (p.models || []).slice();
+			document.getElementById('model-spec-title').textContent = '模型规格 · ' + p.name;
+			document.getElementById('model-spec-modal').classList.add('active');
+			loadModelSpecs(false);
+		}
+
+		function closeModelSpecModal() {
+			document.getElementById('model-spec-modal').classList.remove('active');
+		}
+
+		function reloadModelSpecs() {
+			loadModelSpecs(true);
 		}
 
 		function renderHealthTable() {
