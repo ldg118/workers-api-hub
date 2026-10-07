@@ -39,19 +39,9 @@
 
 ### 3. 上传部署
 
-两种方式都能跑：
+Workers & Pages → Pages → Create → Direct Upload → 填项目名 → Create project → 直接把 `_worker.js` 拖到上传区域 → 选环境（生产/预览）→ 保存并部署。
 
-**路径 A · Pages Direct Upload（推荐）** ⭐
-1. Workers & Pages → Pages → Create → Direct Upload → 填项目名 → Create project
-2. 直接把 `_worker.js` 单文件拖到上传区域（374KB，一个文件就够）
-3. Pages 自动识别 `_worker.js`，切到 Functions Advanced mode 跑它
-4. 选环境（生产 / 预览）→ 保存并部署
-
-**路径 B · Workers Direct Upload**
-1. Workers & Pages → Workers → Create → Direct Upload
-2. 选择 `_worker.js` 单文件上传
-
-> ⚠️ **Quick Edit 粘贴 `_worker.js`** 很可能报 `Error 1101`——文件 10000+ 行，Quick Edit 粘贴大文件容易截断。上面两条路径没这问题。
+> ⚠️ **别用 Workers → Quick Edit 粘贴** `_worker.js`，文件 10000+ 行容易截断导致报 `Error 1101`。上面这条路径没这问题。
 
 ### 部署后自检
 
