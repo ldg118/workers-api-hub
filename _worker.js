@@ -1,8 +1,8 @@
 /**
- * EdgeLLM Gateway
- * 一个边缘 AI 网关：把 Cloudflare Workers AI 与第三方 OpenAI 兼容渠道（OpenRouter、Gemini 等）
- * 统一转换成 OpenAI / Anthropic 双协议接口；支持多上游负载均衡、调用配额调度、
- * 故障冷却与自动切换，并自带可视化管理面板。
+ * Workers API Hub
+ * Cloudflare Workers 上的多上游 API 网关：把第三方 OpenAI 兼容渠道（OpenRouter、Gemini 等）
+ * 与 Cloudflare Workers AI 账号池统一转换成 OpenAI / Anthropic 双协议接口；
+ * 支持负载均衡、调用配额调度、故障冷却与自动切换，并自带可视化管理面板。
  */
 
 // 构建标识：部署后 curl /version（或看落地页页脚）核对线上版本。
@@ -10,7 +10,7 @@
 // ★★ 硬约定：**每次改动 _worker.js 都要把版本号 +1**（日期变了就用新日期、序号归 1）。
 //    格式固定 `YYYY-MM-DD.N`。验证脚本会拦下格式不对的值，但「有没有 +1」只能靠自觉 ——
 //    曾经因为版本号没变，本地/线上分不清哪个是哪版，白排查了一整轮。
-const BUILD_ID = '2026-10-06.60';
+const BUILD_ID = '2026-10-06.61';
 
 // 系统默认密钥自动轮换参数
 const ROTATE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000; // 轮换周期：7 天
@@ -4495,7 +4495,7 @@ async function handleLandingPage(request, env, ctx) {
 	<meta charset="UTF-8">
 	<meta name="robots" content="noindex, nofollow">
 	<meta name="viewport" content="width=device-width, initial-scale=1.0">
-	<title>EdgeLLM Gateway · 边缘 AI 网关</title>
+	<title>Workers API Hub</title>
 	<link rel="preconnect" href="https://fonts.googleapis.com">
 	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 	<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
@@ -5144,7 +5144,7 @@ async function handleLandingPage(request, env, ctx) {
 	<div class="dashboard-container">
 		<div class="login-header animate-fade-in-up" style="margin-bottom: 24px;">
 			<div class="logo-icon">AI</div>
-			<span class="logo-text">EdgeLLM Gateway</span>
+			<span class="logo-text">Workers API Hub</span>
 		</div>
 
 		<div class="dashboard-grid${cfEnabled ? '' : ' provider-only'}">
@@ -5516,7 +5516,7 @@ async function handleLandingPage(request, env, ctx) {
 		}
 	</script>
 	<footer style="text-align: center; padding: 120px 0 20px; font-size: 12px; color: var(--text-muted); opacity: 0.6; z-index: 10;">
-		EdgeLLM Gateway · build ${BUILD_ID}
+		Workers API Hub · build ${BUILD_ID}
 	</footer>
 </body>
 </html>`;
@@ -5544,7 +5544,7 @@ async function handleAdminPage(request, env, ctx) {
 	<meta charset="UTF-8">
 	<meta name="robots" content="noindex, nofollow">
 	<meta name="viewport" content="width=device-width, initial-scale=1.0">
-	<title>EdgeLLM Gateway Dashboard</title>
+	<title>Workers API Hub Dashboard</title>
 	<link rel="preconnect" href="https://fonts.googleapis.com">
 	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 	<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -6798,7 +6798,7 @@ async function handleAdminPage(request, env, ctx) {
 	<div style="display: flex; justify-content: space-between; align-items: center; padding: 15px 20px; background-color: var(--sidebar-bg); border-bottom: 1px solid var(--border-color); z-index: 90;" class="mobile-header">
 		<div class="logo-area" style="margin-bottom: 0;">
 			<div class="logo-icon">AI</div>
-			<span class="logo-text">EdgeLLM Gateway</span>
+			<span class="logo-text">Workers API Hub</span>
 		</div>
 		<div style="display: flex; align-items: center; gap: 12px;">
 			<button class="mobile-nav-toggle" onclick="toggleSidebar()">
@@ -6813,7 +6813,7 @@ async function handleAdminPage(request, env, ctx) {
 		<aside id="sidebar">
 			<div class="logo-area">
 				<div class="logo-icon">AI</div>
-				<span class="logo-text">EdgeLLM Gateway</span>
+				<span class="logo-text">Workers API Hub</span>
 			</div>
 
 			<div class="runtime-status" onclick="openRuntimeModal()" title="点击修改运行模式">
@@ -6855,7 +6855,7 @@ async function handleAdminPage(request, env, ctx) {
 
 			<div class="aside-footer">
 				<div style="text-align: center; font-size: 11px; color: var(--text-muted); opacity: 0.55; padding-top: 4px;">
-					EdgeLLM Gateway
+					Workers API Hub
 				</div>
 			</div>
 		</aside>
@@ -10134,7 +10134,7 @@ function handleKVError(request) {
 <head>
 	<meta charset="UTF-8">
 	<meta name="viewport" content="width=device-width, initial-scale=1.0">
-	<title>KV 绑定异常 - EdgeLLM Gateway</title>
+	<title>KV 绑定异常 - Workers API Hub</title>
 	<link rel="preconnect" href="https://fonts.googleapis.com">
 	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 	<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
@@ -10315,7 +10315,7 @@ function handlePasswordError(request) {
 <head>
 	<meta charset="UTF-8">
 	<meta name="viewport" content="width=device-width, initial-scale=1.0">
-	<title>管理员密码未配置 - EdgeLLM Gateway</title>
+	<title>管理员密码未配置 - Workers API Hub</title>
 	<link rel="preconnect" href="https://fonts.googleapis.com">
 	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 	<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
