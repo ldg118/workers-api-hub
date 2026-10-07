@@ -10,7 +10,7 @@
 // ★★ 硬约定：**每次改动 _worker.js 都要把版本号 +1**（日期变了就用新日期、序号归 1）。
 //    格式固定 `YYYY-MM-DD.N`。验证脚本会拦下格式不对的值，但「有没有 +1」只能靠自觉 ——
 //    曾经因为版本号没变，本地/线上分不清哪个是哪版，白排查了一整轮。
-const BUILD_ID = '2026-10-06.82';
+const BUILD_ID = '2026-10-06.83';
 
 // 系统默认密钥自动轮换参数
 const ROTATE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000; // 轮换周期：7 天
@@ -7511,7 +7511,7 @@ async function handleAdminPage(request, env, ctx) {
 
 				<!-- TAB: Overview -->
 				<div id="tab-overview" class="tab-content${defaultTab === 'overview' ? ' active' : ''}">
-					<!-- 第三方渠道调用统计（本代理埋点，与下方 CF 官方账单是两条独立链路） -->
+					<!-- 第三方渠道调用统计（与下方 CF 官方用量是两条独立数据源） -->
 					<div class="section-card" style="margin-top: 24px;">
 						<div class="section-header">
 							<div class="section-title">第三方渠道调用</div>
@@ -7522,7 +7522,7 @@ async function handleAdminPage(request, env, ctx) {
 								<button class="btn btn-secondary" id="stats-refresh" onclick="refreshProviderStats()" title="重新从 D1 读取统计" style="padding: 6px 12px; font-size: 12px;">↻ 刷新</button>
 							</div>
 						</div>
-						<div class="section-note">数据来自本代理埋点（每次调用写一条到 D1），统计口径是「经过本代理的请求」，与上游账单不是一回事。</div>
+						<div class="section-note">仅统计「经过本代理」的第三方渠道请求；与上游账单口径不同，仅供参考。</div>
 
 						<div id="provider-stats-disabled" style="display: none; background-color: rgba(245, 158, 11, 0.1); border: 1px solid rgba(245, 158, 11, 0.2); padding: 14px 16px; border-radius: 12px; font-size: 13px; color: var(--warning-color); line-height: 1.6; margin-top: 14px;">
 							<strong>统计未启用：</strong> 未绑定 D1 数据库。建库后在 Worker 设置里加 D1 绑定（变量名填 <code>DB</code>）并重新部署，首次调用会自动建表。
@@ -8604,7 +8604,7 @@ async function handleAdminPage(request, env, ctx) {
 
 		initTheme();
 
-		// ---------- 第三方渠道调用统计（本代理埋点，与 CF 官方账单是两条独立链路） ----------
+		// ---------- 第三方渠道调用统计（与 CF 官方用量是两条独立数据源） ----------
 		let statsRange = 'today';
 
 		function setStatsRange(r) {

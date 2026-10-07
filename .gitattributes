@@ -1,0 +1,20 @@
+# 统一换行符为 LF。
+# 背景：本机 git core.autocrlf=true，检出/外部编辑器会把源码转成 CRLF ——
+# 会让 _worker.js 凭空 +11KB，并打断验证脚本按 \n 的锚点匹配
+# （曾导致 _verify_mapping_ui.mjs 报「未找到 toggleMappingGroup 结尾」）。
+* text=auto eol=lf
+
+# 正本与文档 / 脚本：显式钉死 LF（双保险）
+_worker.js text eol=lf
+*.mjs      text eol=lf
+*.md       text eol=lf
+*.sh       text eol=lf
+
+# 二进制资源不做换行转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.zip binary
