@@ -10,7 +10,7 @@
 // ★★ 硬约定：**每次改动 _worker.js 都要把版本号 +1**（日期变了就用新日期、序号归 1）。
 //    格式固定 `YYYY-MM-DD.N`。验证脚本会拦下格式不对的值，但「有没有 +1」只能靠自觉 ——
 //    曾经因为版本号没变，本地/线上分不清哪个是哪版，白排查了一整轮。
-const BUILD_ID = '2026-10-06.61';
+const BUILD_ID = '2026-10-06.66';
 
 // 系统默认密钥自动轮换参数
 const ROTATE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000; // 轮换周期：7 天
@@ -5516,7 +5516,7 @@ async function handleLandingPage(request, env, ctx) {
 		}
 	</script>
 	<footer style="text-align: center; padding: 120px 0 20px; font-size: 12px; color: var(--text-muted); opacity: 0.6; z-index: 10;">
-		Workers API Hub · build ${BUILD_ID}
+		<a href="https://github.com/ldg118/workers-api-hub" target="_blank" rel="noopener noreferrer" style="color: inherit; text-decoration: none; border-bottom: 1px solid currentColor;">GitHub</a> · Workers API Hub · build ${BUILD_ID}
 	</footer>
 </body>
 </html>`;
@@ -6855,7 +6855,7 @@ async function handleAdminPage(request, env, ctx) {
 
 			<div class="aside-footer">
 				<div style="text-align: center; font-size: 11px; color: var(--text-muted); opacity: 0.55; padding-top: 4px;">
-					Workers API Hub
+					<a href="https://github.com/ldg118/workers-api-hub" target="_blank" rel="noopener noreferrer" style="color: inherit; text-decoration: none; border-bottom: 1px solid currentColor;">GitHub</a> · Workers API Hub
 				</div>
 			</div>
 		</aside>
