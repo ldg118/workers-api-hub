@@ -165,3 +165,21 @@ tools → functionDeclarations 转换、工具参数 schema 白名单清洗、th
 
 - [Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api)
 - [cmliussss2024/WorkersAI2API](https://github.com/cmliussss2024/WorkersAI2API)
+
+---
+
+## ⚠️ 免责声明
+
+本项目按"原样"提供，作者**不对本项目的稳定性、安全性、准确性、适用性**做任何明示或暗示的担保。本项目仅用于学习研究。
+
+### 风险提示
+
+1. **上游第三方渠道不可控**：OpenRouter、Google Gemini、xAI Grok、OpenAI、Anthropic 等外部服务的 API 格式、定价、可用性、服务条款随时可能变更，本项目无法保证与上述服务的持续兼容。因上游变更导致的调用失败、超支、合规问题，作者不承担任何责任。
+
+2. **Cloudflare 免费额度有限**：Workers / KV / D1 均有每日配额上限，配额耗尽将导致服务中断。生产使用需自行评估升级付费方案。
+
+3. **安全责任自负**：部署时请务必为 `ADMIN_PASSWORD` 设置强密码，并建议启用 `ADMIN_USERNAME` 双因子登录。若因弱密码、密钥泄露或配置不当导致的任何损失，作者不承担任何责任。
+
+4. **合规自负**：使用者需自行遵守 OpenAI / Anthropic / Google / xAI / Cloudflare 等上游的服务条款，以及本人所在国家/地区的法律法规。本项目仅做协议转换与分发，不对通过本项目产生的任何 AI 生成内容承担责任。
+
+5. **数据与隐私**：本项目将上游返回的模型输出原样转发给调用方，不对内容进行二次处理、审查或存储（除用户显式开启 D1 统计）。使用者需自行评估所处理内容的合规性。
