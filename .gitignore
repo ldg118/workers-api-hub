@@ -6,9 +6,13 @@ _backup/
 
 # 旧副本（含已删除代码，脏数据）
 _worker - 副本.js
+_worker copy.js
 
-# 一次性临时分析脚本
+# 一次性临时分析/验证脚本
 _analyze_deadcode.mjs
+_dryrun_*.mjs
+_probe_*.sh
+_verify_*.mjs
 
 # 系统/编辑器
 .DS_Store
