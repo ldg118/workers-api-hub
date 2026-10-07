@@ -1,10 +1,10 @@
 # Workers API Hub
 
-**Workers API Hub** 是跑在 Cloudflare Workers 上的单文件 ES Module：把 Cloudflare Workers AI 账号池与第三方 OpenAI 兼容渠道（OpenRouter、Gemini 免费层等）统一转换成 **OpenAI / Anthropic 双协议**接口。零依赖，前端全内联，部署 = 把 `_worker.js` 单文件 Direct Upload 到 Cloudflare。核心能力：多上游聚合、配额调度、负载均衡、故障冷却与自动切换、内置管理面板。
+**Workers API Hub** 是跑在 Cloudflare 上的单文件 ES Module：把 Cloudflare Workers AI 账号池与第三方 OpenAI 兼容渠道（OpenRouter、Gemini 免费层等）统一转换成 **OpenAI / Anthropic 双协议**接口。零依赖，前端全内联，部署 = 把 `_worker.js` 上传到 Cloudflare Pages（推荐 `wrangler pages deploy` 或 Git 集成，详见下方「部署」）。核心能力：多上游聚合、配额调度、负载均衡、故障冷却与自动切换、内置管理面板。
 
 > **适用场景**：不想买 VPS / 不想维护服务器，但需要代理海外模型（国内无法直连 OpenRouter / Gemini / OpenAI）。Workers 免费额度够开发用，免运维。国内可直连的上游不建议用——多跳 Cloudflare Edge 徒增延迟。
 
-> 版本号：当前 `BUILD_ID = 2026-10-06.60`，每次改动 +1，部署后 `curl /version` 核对。
+> 版本号：当前 `BUILD_ID = 2026-10-06.61`，每次改动 +1，部署后 `curl /version` 核对。
 
 ## 界面预览
 
@@ -79,7 +79,12 @@
 
 ## 部署
 
-**实际路径：Workers Direct Upload**（Dashboard → Workers & Pages → Workers → Create → Direct Upload，上传 `_worker.js` 单文件，零依赖，ES Module）。
+**推荐路径：Cloudflare Pages**（Git 集成 或 `wrangler pages deploy` CLI）。
+
+- 入口是单文件 `_worker.js`，在 Pages 里以 **Advanced mode（`_worker.js`）** 形式运行，处理所有路由（含 `/`）。
+- **Git 集成**：把本仓库连到 Cloudflare Pages，push 即部署。
+- **`wrangler pages deploy` CLI**：在含 `_worker.js` 的目录执行，上传即部署。
+- ⚠️ **Cloudflare 控制台 Pages 的「Direct Upload」（拖拽 / 压缩包上传）不支持 Functions**——用这种方式 `_worker.js` 不会生效、`/` 会 404。请走上面的 CLI 或 Git 集成。
 
 > 代码里硬约定 `BUILD_ID`（`YYYY-MM-DD.N` 格式）在文件顶部，**每次改 `_worker.js` 必须手动 +1**（日期变了序号归 1）。部署后 `curl https://<域名>/version` 核对，防止"改了没生效"白排查。
 
