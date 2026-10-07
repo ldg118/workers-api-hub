@@ -6,7 +6,7 @@
 
 ## 界面预览
 
-**登录落地页（`/`）**
+**登录落地页**
 
 ![登录落地页](picture/landing-dark.png)
 
@@ -55,19 +55,7 @@
 
 ### 部署后自检
 
-```bash
-# 第 0 步：先验证版本号对得上，再往下走（防部署没生效白排查）
-curl https://<你的域名>/version
-# 返回 {"build":"YYYY-MM-DD.N"}
-
-# 第 1 步：落地页能打开
-curl -I https://<你的域名>/
-
-# 第 2 步：后台能登录（浏览器访问）
-# https://<你的域名>/admin → 用 ADMIN_PASSWORD 登录
-```
-
-> 硬约定：**每次改 `_worker.js` 必须手动把 `BUILD_ID` +1**（格式 `YYYY-MM-DD.N`）。代码顶部有注释写死了这条。
+部署完打开 `https://<你的域名>/version`，返回的 `build` 值要和代码里 `BUILD_ID` 对得上——对不上就是部署没生效，白排查。
 
 ---
 
