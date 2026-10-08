@@ -10,7 +10,7 @@
 // ★★ 硬约定：**每次改动 _worker.js 都要把版本号 +1**（日期变了就用新日期、序号归 1）。
 //    格式固定 `YYYY-MM-DD.N`。验证脚本会拦下格式不对的值，但「有没有 +1」只能靠自觉 ——
 //    曾经因为版本号没变，本地/线上分不清哪个是哪版，白排查了一整轮。
-const BUILD_ID = '2026-10-06.100';
+const BUILD_ID = '2026-10-06.103';
 
 // 系统默认密钥自动轮换参数
 const ROTATE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000; // 轮换周期：7 天
@@ -873,9 +873,10 @@ async function pickQuotaMember(group, env, opts) {
 		return { ok: true, providerId: first.m.providerId, model: first.m.model, used: first.used, limit: first.limit };
 	}
 
-	// 会话粘性（组级开关打开时）：同一会话尽量落到同一个成员 —— 多轮对话 / 工具调用更稳。
+	// 会话粘性：同一会话尽量落到同一个成员 —— 多轮对话 / 工具调用更稳（保住上游 Prompt 缓存）。
 	// 用「组内配置顺序 + 会话散列」确定性计算，不需要存状态；该成员不可用时自动回落均衡。
-	if (opts.sessionKey && group.sticky === true) {
+	// ★ 默认开启（opt-out）：只有显式设为 false 才关闭；未设置一律视为开。
+	if (opts.sessionKey && group.sticky !== false) {
 		const want = usable[hashString(opts.sessionKey) % usable.length];
 		const hit = rows.find(r => r.m._key === want._key);
 		if (hit) return { ok: true, providerId: hit.m.providerId, model: hit.m.model, used: hit.used, limit: hit.limit, sticky: true };
@@ -1559,10 +1560,11 @@ async function ensureStatsTable(env) {
 	if (Date.now() < statsTableRetryAfter) return;
 	try {
 		await env.DB.prepare(STATS_TABLE_SQL).run();
-		// 老表补列：测试/探测调用单独计数（语句失败说明列已存在，忽略）。
-		// last_ms/last_at = 最近一次调用的延迟与时刻，每次都覆盖写（看板「最近」列的数据源）。
-		// 只在这里跑一次，statsTableReady 之后就跳过了。
-		for (const [col, def] of [
+		// 老表补列：测试/探测调用单独计数。
+		// ★ 先 PRAGMA 查一次现有列，只 ALTER 缺的那些（2026-10-08 优化）：
+		//   旧实现无条件跑 10 条 ALTER，列已存在时**每条都必然抛错** → 冷启动白花 10 次 D1 往返。
+		//   新表由 STATS_TABLE_SQL 一次建全 → 这里 0 条 ALTER，冷路径只剩 1×CREATE + 1×PRAGMA。
+		const wantCols = [
 			['probe_req', 'INTEGER NOT NULL DEFAULT 0'],
 			['probe_ok', 'INTEGER NOT NULL DEFAULT 0'],
 			['probe_fail', 'INTEGER NOT NULL DEFAULT 0'],
@@ -1574,7 +1576,14 @@ async function ensureStatsTable(env) {
 			['output_tokens', 'INTEGER NOT NULL DEFAULT 0'],
 			['last_ms', 'INTEGER NOT NULL DEFAULT 0'],
 			['last_at', 'TEXT']
-		]) {
+		];
+		let have = null;
+		try {
+			const info = await env.DB.prepare('PRAGMA table_info(stats)').all();
+			if (info && Array.isArray(info.results)) have = new Set(info.results.map(r => String(r.name)));
+		} catch (_) { have = null; } // PRAGMA 不可用 → 退回逐条试着加（老行为，仍正确）
+		for (const [col, def] of wantCols) {
+			if (have && have.has(col)) continue;
 			try {
 				await env.DB.prepare(`ALTER TABLE stats ADD COLUMN ${col} ${def}`).run();
 			} catch (e) { /* 列已存在 */ }
@@ -1732,10 +1741,24 @@ function withUsageTap(stream, onUsage) {
 // 落地页公开汇总接口（/api/public/provider-stats）的 isolate 内缓存，30s TTL，避免公开端点被刷穿 D1
 let publicProviderSummaryCache = null;
 
+// 管理看板统计的 isolate 内短缓存（默认 8s；env.STATS_CACHE_MS 可覆盖，0=关闭，验证脚本用 0）。
+// 面板「第三方渠道 / 数据看板」来回切会反复拉同一份数据 —— 缓存后几乎瞬开、不再打 D1（2026-10-08）。
+const statsCache = new Map();
+function statsCacheMs(env) {
+	const v = Number(env && env.STATS_CACHE_MS);
+	return Number.isFinite(v) && v >= 0 ? v : 8000;
+}
+
 // 第三方渠道统计：总览 + 按渠道（含各模型明细）
 // 数据全部来自本代理埋点，与 CF 官方账单是两条独立链路
 async function queryProviderStats(env, range, includeInactive = false) {
 	if (!env.DB) return { enabled: false, reason: 'no-db' };
+	const cacheMs = statsCacheMs(env);
+	const cacheKey = 'stats:' + range + ':' + (includeInactive ? 1 : 0);
+	if (cacheMs > 0) {
+		const hit = statsCache.get(cacheKey);
+		if (hit) { if (Date.now() < hit.expiry) return hit.value; statsCache.delete(cacheKey); }
+	}
 	await ensureStatsTable(env);
 	// 第三方渠道「估算成本」单价（美元 / 千 token），纯示意估算，非真实账单。
 	// 想更准就按渠道/模型配价；这里只做 Token 级粗估，可用环境变量 THIRD_PARTY_EST_COST_PER_1K 覆盖。
@@ -1797,51 +1820,66 @@ async function queryProviderStats(env, range, includeInactive = false) {
 	if (range === 'today') sinceDay = today;
 	else if (range === '7d') sinceDay = new Date(Date.now() - 6 * 86400000).toISOString().slice(0, 10);
 
-	const where = sinceDay ? 'WHERE day >= ?' : '';
-	const args = sinceDay ? [sinceDay] : [];
-	const run = (stmt) => (sinceDay ? stmt.bind(...args) : stmt).all();
-
-	// 总览(summary)改由下方过滤后的 providerList 聚合得出，不再单独查全量 totalsStmt
-	// （这样「含已停用渠道」开关开启时，总览数字与明细始终一致）。
-
-	const rowsStmt = env.DB.prepare(
-		// MAX(last_at) + 裸列 last_ms：SQLite 规定裸列取自 MAX 命中的那一行 —— 即拿到「最近一次」的延迟
-		'SELECT provider_id, provider_name, model, SUM(req) AS req, SUM(ok) AS ok, SUM(fail) AS fail, SUM(ms_total) AS msTotal, SUM(probe_req) AS probeReq, SUM(probe_ok) AS probeOk, SUM(probe_fail) AS probeFail, SUM(probe_ms_total) AS probeMsTotal, SUM(tokens) AS tokens, SUM(reasoning_tokens) AS reasoningTokens, SUM(input_tokens) AS inputTokens, SUM(output_tokens) AS outputTokens, MAX(last_at) AS lastAt, last_ms AS lastMs FROM stats ' + where + ' GROUP BY provider_id, model ORDER BY req DESC'
-	);
-	let rows = (await run(rowsStmt)).results || [];
-	if (!includeInactive) rows = rows.filter(r => isProviderVisible(r.provider_id) && isModelVisible(r.model));
-
-	// 图表数据①：近 7 日逐日逐模型 token（趋势折线，固定 7 天窗口，不受 range 切换影响）
-	// tokens 列只在真实转发时写入（探测不记 token），所以这里天然不含探测流量
+	// ★ 单次 D1 查询同时喂三块（rows / trend / today）—— 原来 3 条串行往返是「切 tab 慢」的主因（2026-10-08）。
+	//   窗口取三者的并集：today/7d 都只需近 7 天（趋势固定 7 天窗口），all 需全部 → 不设 day 过滤。
+	//   三块聚合（按 渠道+模型 / 按 模型+日 / 今日按模型）改在 JS 里算 —— 行数 = 渠道×日×模型，很小。
 	const weekStart = new Date(Date.now() - 6 * 86400000).toISOString().slice(0, 10);
 	const dayList = [];
 	for (let i = 6; i >= 0; i--) dayList.push(new Date(Date.now() - i * 86400000).toISOString().slice(0, 10));
-	let trendRows = (await env.DB.prepare(
-		'SELECT provider_id, substr(day,1,10) AS d, model, SUM(tokens) AS tokens FROM stats WHERE day >= ? GROUP BY provider_id, d, model ORDER BY d'
-	).bind(weekStart).all()).results || [];
-	if (!includeInactive) trendRows = trendRows.filter(r => isProviderVisible(r.provider_id) && isModelVisible(r.model));
-	const trendByModel = new Map();
-	for (const r of trendRows) {
-		if (!trendByModel.has(r.model)) trendByModel.set(r.model, {});
-		trendByModel.get(r.model)[r.d] = (trendByModel.get(r.model)[r.d] || 0) + (r.tokens || 0);
-	}
+	const mergedSince = sinceDay ? weekStart : null; // 有 range 过滤时 weekStart ≤ sinceDay，覆盖三者
+	const rawStmt = env.DB.prepare(
+		'SELECT provider_id, provider_name, model, substr(day,1,10) AS d, req, ok, fail, ms_total AS msTotal,'
+		+ ' probe_req AS probeReq, probe_ok AS probeOk, probe_fail AS probeFail, probe_ms_total AS probeMsTotal,'
+		+ ' tokens, reasoning_tokens AS reasoningTokens, input_tokens AS inputTokens, output_tokens AS outputTokens,'
+		+ ' last_at AS lastAt, last_ms AS lastMs FROM stats'
+		+ (mergedSince ? ' WHERE day >= ?' : '')
+	);
+	const rawRows = ((mergedSince ? await rawStmt.bind(mergedSince).all() : await rawStmt.all()).results) || [];
 
-	// 图表数据②：今日逐模型 token + 请求数（占比环形，请求数含探测 probe_req，与配额面板口径一致）
-	let todayRows = (await env.DB.prepare(
-		'SELECT provider_id, model, SUM(tokens) AS tokens, SUM(req) AS req, SUM(probe_req) AS probeReq FROM stats WHERE day >= ? GROUP BY provider_id, model ORDER BY tokens DESC'
-	).bind(today).all()).results || [];
-	if (!includeInactive) todayRows = todayRows.filter(r => isProviderVisible(r.provider_id) && isModelVisible(r.model));
-	// 按模型合并回一行：本查询按（渠道, 模型）分组（为按渠道过滤已停用渠道），但「今日模型消耗占比」按模型渲染——
-	// 不合并的话，同名模型会被按渠道拆成多条（.84 回归：环形图出现重复模型名）。无论是否含停用渠道都必须合并。
-	{
-		const byModel = new Map();
-		for (const r of todayRows) {
-			const cur = byModel.get(r.model);
-			if (cur) { cur.tokens += r.tokens || 0; cur.req += r.req || 0; cur.probeReq += r.probeReq || 0; }
-			else byModel.set(r.model, { model: r.model, tokens: r.tokens || 0, req: r.req || 0, probeReq: r.probeReq || 0 });
+	// 三块聚合桶
+	const rowAgg = new Map();        // provider_id|model → rows 行
+	const trendByModel = new Map();  // model → { [day]: tokens }
+	const todayAgg = new Map();      // model → { model, tokens, req, probeReq }
+	for (const r of rawRows) {
+		// 可见性过滤（与原三处 filter 等价；includeInactive 时两个判断恒真）
+		if (!isProviderVisible(r.provider_id) || !isModelVisible(r.model)) continue;
+		const pid = String(r.provider_id);
+		const d = String(r.d);
+		// ① rows：受 range 限制
+		if (!sinceDay || d >= sinceDay) {
+			const k = pid + '\u0000' + String(r.model);
+			let cur = rowAgg.get(k);
+			if (!cur) {
+				cur = {
+					provider_id: pid, provider_name: r.provider_name, model: r.model,
+					req: 0, ok: 0, fail: 0, msTotal: 0, probeReq: 0, probeOk: 0, probeFail: 0, probeMsTotal: 0,
+					tokens: 0, reasoningTokens: 0, inputTokens: 0, outputTokens: 0, lastAt: null, lastMs: 0
+				};
+				rowAgg.set(k, cur);
+			}
+			cur.req += r.req || 0; cur.ok += r.ok || 0; cur.fail += r.fail || 0;
+			cur.msTotal += r.msTotal || 0; cur.probeReq += r.probeReq || 0; cur.probeOk += r.probeOk || 0;
+			cur.probeFail += r.probeFail || 0; cur.probeMsTotal += r.probeMsTotal || 0;
+			cur.tokens += r.tokens || 0; cur.reasoningTokens += r.reasoningTokens || 0;
+			cur.inputTokens += r.inputTokens || 0; cur.outputTokens += r.outputTokens || 0;
+			// 等价原 SQL 的「MAX(last_at) + 裸列 last_ms」：取 last_at 最新那一行的 last_ms
+			if (r.lastAt && (!cur.lastAt || String(r.lastAt) >= String(cur.lastAt))) { cur.lastAt = r.lastAt; cur.lastMs = r.lastMs || 0; }
 		}
-		todayRows = [...byModel.values()].sort((a, b) => (b.tokens - a.tokens) || (b.req - a.req));
+		// ② 趋势 / ③ 今日：固定近 7 天窗口
+		if (d >= weekStart) {
+			let tm = trendByModel.get(r.model);
+			if (!tm) { tm = {}; trendByModel.set(r.model, tm); }
+			tm[d] = (tm[d] || 0) + (r.tokens || 0);
+			if (d === today) {
+				let ta = todayAgg.get(r.model);
+				if (!ta) { ta = { model: r.model, tokens: 0, req: 0, probeReq: 0 }; todayAgg.set(r.model, ta); }
+				ta.tokens += r.tokens || 0; ta.req += r.req || 0; ta.probeReq += r.probeReq || 0;
+			}
+		}
 	}
+	const rows = [...rowAgg.values()].sort((a, b) => (b.req || 0) - (a.req || 0));
+	// 今日按模型合并回一行（同名模型不能按渠道拆成多条 —— .84 回归）
+	const todayRows = [...todayAgg.values()].sort((a, b) => (b.tokens - a.tokens) || (b.req - a.req));
 
 	// 把「渠道 + 模型」的扁平行聚成两层结构
 	const byProvider = new Map();
@@ -1922,7 +1960,7 @@ async function queryProviderStats(env, range, includeInactive = false) {
 		return a;
 	}, { req: 0, ok: 0, fail: 0, msTotal: 0, probeReq: 0, probeOk: 0, probeFail: 0, probeMsTotal: 0, tokens: 0, reasoningTokens: 0, inputTokens: 0, outputTokens: 0 });
 
-	return {
+	const out = {
 		enabled: true,
 		range,
 		sinceDay,
@@ -1935,6 +1973,8 @@ async function queryProviderStats(env, range, includeInactive = false) {
 		},
 		todayByModel: todayRows.map(r => ({ model: r.model, tokens: r.tokens || 0, req: (r.req || 0) + (r.probeReq || 0) }))
 	};
+	if (cacheMs > 0) statsCache.set(cacheKey, { expiry: Date.now() + cacheMs, value: out });
+	return out;
 }
 
 // ============================================================
@@ -4857,19 +4897,20 @@ async function handleDashboardApi(request, env, ctx) {
 	// 12. 配额组：一组候选模型 + 各自的次数上限，按顺序自动切换到未满的那个
 	if (url.pathname === '/api/quota-groups') {
 		if (method === 'GET') {
-			const config = await getAppConfig(env);
+			// 配置与冷却表互不依赖 → 并行读（原来串行 = 2 次往返）
+			const [config, cooldowns] = await Promise.all([getAppConfig(env), getCooldowns(env)]);
 			const groups = config.quotaGroups || [];
 			const providers = config.providers || [];
 			const nowMs = Date.now();
-			// 调度状态也一并回给界面：冷却中的成员要「看得见」（谁在冷却 / 还剩多久 / 为什么）
-			const cooldowns = await getCooldowns(env);
 
 			// 每个组可以有自己的重置时区/时刻，窗口不同 —— 所以逐组查用量，不能合并成两次查询
 			const groupsOut = [];
 			for (const g of groups) {
-				const map = await queryQuotaUsage(env, g, g.members || []);
-				// 本小时用量 = 负载均衡的依据，也展示给用户看
-				const hourMap = await queryQuotaHourUsage(env, g.members || []);
+				// 本周期用量 + 本小时用量互不依赖 → 并行（原来串行 = 2 次 D1 往返）
+				const [map, hourMap] = await Promise.all([
+					queryQuotaUsage(env, g, g.members || []),
+					queryQuotaHourUsage(env, g.members || []),
+				]);
 				const win = quotaWindow(g, nowMs);
 				groupsOut.push({
 					...g,
@@ -4880,7 +4921,7 @@ async function handleDashboardApi(request, env, ctx) {
 					nextResetText: fmtBeijing(win.endMs),
 					// 同一个瞬间在「组自己时区」里的写法：界面并排显示，说清两个数是同一时刻
 					nextResetLocalText: fmtInOffset(win.endMs, win.offsetMin),
-					sticky: g.sticky === true,
+					sticky: g.sticky !== false,
 					members: (g.members || []).map(m => {
 						const p = providers.find(x => x.id === m.providerId);
 						const k = JSON.stringify([String(m.providerId), String(m.model)]);
@@ -4972,8 +5013,8 @@ async function handleDashboardApi(request, env, ctx) {
 				resetTz: Object.prototype.hasOwnProperty.call(RESET_TZ_PRESETS, resetTzKey) ? resetTzKey : 'utc',
 				resetLocalTime: normalizeResetTime(body.resetLocalTime),
 				resetTzOffset: Math.max(-840, Math.min(840, Math.round(Number(body.resetTzOffset) || 0))),
-				// 会话粘性：同一会话尽量固定同一个成员（多轮/工具调用更稳）；默认关
-				sticky: body.sticky === true,
+				// 会话粘性：同一会话尽量固定同一个成员（多轮/工具调用更稳）；默认开（未设置即视为开）
+				sticky: body.sticky !== false,
 				members
 			};
 
@@ -5270,6 +5311,24 @@ const COMMON_TOAST_JS = `
 `;
 
 // 1. 首页 / 登录页
+// 页面响应的缓存头：private（仅本人/管理员可见）+ no-cache（每次用 If-None-Match 校验）+ ETag。
+// ★ 不用 max-age：页面内容含「登录态 + 运行模式(CF开关) + BUILD_ID」，必须每次校验；
+//   校验命中即回 304，省掉整页重下（2026-10-08：面板页 ~205KB，是「加载慢」的主因）。
+function htmlCacheHeaders(etag) {
+	return {
+		'Content-Type': 'text/html; charset=utf-8',
+		'ETag': etag,
+		'Cache-Control': 'private, no-cache',
+	};
+}
+
+// If-None-Match 命中判定（浏览器可能带多个候选，按逗号拆开逐个比）
+function etagMatches(request, etag) {
+	const inm = request.headers.get('If-None-Match');
+	if (!inm) return false;
+	return inm.split(',').some(s => s.trim() === etag || s.trim() === '*');
+}
+
 async function handleLandingPage(request, env, ctx) {
 	// ⚠️ 模板里（悬浮按钮 / 登录弹窗）引用了 isLoggedIn，删了这里就会 Error 1101（2026-10-05 踩过）
 	const isLoggedIn = await verifyAdminCookie(request, env);
@@ -5277,6 +5336,10 @@ async function handleLandingPage(request, env, ctx) {
 	const requireUsername = adminCredentials(env).requireUsername;
 	// 账号池关闭时首页不显示 CF 用量看板（纯第三方反代模式下那些数字恒为 0）
 	const cfEnabled = await getCfPoolEnabled(env);
+
+	// 内容指纹：随 构建号 / 登录态 / 用户名模式 / 运行模式 变
+	const pageEtag = '"lp-' + BUILD_ID + '-' + (isLoggedIn ? 'in' : 'out') + '-' + (requireUsername ? 'u' : 'nu') + '-' + (cfEnabled ? 'cf' : 'ncf') + '"';
+	if (etagMatches(request, pageEtag)) return new Response(null, { status: 304, headers: htmlCacheHeaders(pageEtag) });
 
 	const html = `<!DOCTYPE html>
 <head>
@@ -6316,9 +6379,7 @@ async function handleLandingPage(request, env, ctx) {
 </body>
 </html>`;
 
-	return new Response(html, {
-		headers: { 'Content-Type': 'text/html; charset=utf-8' }
-	});
+	return new Response(html, { headers: htmlCacheHeaders(pageEtag) });
 }
 
 // 2. 后台管理控制台页面
@@ -6326,6 +6387,10 @@ async function handleAdminPage(request, env, ctx) {
 	// 运行模式决定渲染哪些界面：账号池关闭时（纯第三方反代）走「接入信息」作为落地页
 	const cfEnabled = await getCfPoolEnabled(env);
 	const defaultTab = cfEnabled ? 'overview' : 'access';
+
+	// 内容指纹：随 构建号 / 运行模式 变（面板是登录后才可见的壳，数据全走 /api/*）
+	const pageEtag = '"ad-' + BUILD_ID + '-' + (cfEnabled ? 'cf' : 'ncf') + '"';
+	if (etagMatches(request, pageEtag)) return new Response(null, { status: 304, headers: htmlCacheHeaders(pageEtag) });
 
 	// 配额组「重置基准」的时区下拉。offset 挂在 data-offset 上，前端的实时换算直接读它，
 	// 不用再往页面里注一份数据。
@@ -8495,7 +8560,7 @@ async function handleAdminPage(request, env, ctx) {
 				</label>
 				<label style="display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--text-muted); cursor: pointer; margin-top: 8px;">
 					<input type="checkbox" id="quota-sticky" style="width: 16px; height: 16px; padding: 0; margin: 0; flex: none; accent-color: var(--accent-color);">
-					会话粘性（同一个会话尽量固定用同一个成员 —— 多轮对话 / 工具调用更稳，代价是分摊略不均）
+					会话粘性（默认开启；同一个会话尽量固定用同一个成员 —— 多轮对话 / 工具调用更稳，代价是分摊略不均）
 				</label>
 
 				<div id="quota-modal-hint" style="font-size: 12px; color: var(--text-muted); line-height: 1.6;"></div>
@@ -10889,7 +10954,7 @@ async function handleAdminPage(request, env, ctx) {
 			updateQuotaResetPreview();
 			updateQuotaNamePreview();
 			document.getElementById('quota-status-active').checked = g ? g.status !== 'disabled' : true;
-			document.getElementById('quota-sticky').checked = !!(g && g.sticky === true);
+			document.getElementById('quota-sticky').checked = !(g && g.sticky === false);
 			document.getElementById('quota-modal-title').innerText = g ? '编辑配额组' : '新建配额组';
 
 			const members = (g && g.members) || [];
@@ -11194,9 +11259,7 @@ async function handleAdminPage(request, env, ctx) {
 </body>
 </html>`;
 
-	return new Response(html, {
-		headers: { 'Content-Type': 'text/html; charset=utf-8' }
-	});
+	return new Response(html, { headers: htmlCacheHeaders(pageEtag) });
 }
 
 // 3. KV 未绑定时的报错页面
