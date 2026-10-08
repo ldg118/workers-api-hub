@@ -163,8 +163,8 @@ tools → functionDeclarations 转换、工具参数 schema 白名单清洗、th
 
 本项目在开发过程中参考了以下开源项目，特此致谢：
 
-- [Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api)
-- [cmliussss2024/WorkersAI2API](https://github.com/cmliussss2024/WorkersAI2API)
+- [Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api) 借鉴 Gemini 适配
+- [cmliussss2024/WorkersAI2API](https://github.com/cmliussss2024/WorkersAI2API) 基于其主体框架开发
 
 ---
 
