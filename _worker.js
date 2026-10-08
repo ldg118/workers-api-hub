@@ -10,7 +10,7 @@
 // ★★ 硬约定：**每次改动 _worker.js 都要把版本号 +1**（日期变了就用新日期、序号归 1）。
 //    格式固定 `YYYY-MM-DD.N`。验证脚本会拦下格式不对的值，但「有没有 +1」只能靠自觉 ——
 //    曾经因为版本号没变，本地/线上分不清哪个是哪版，白排查了一整轮。
-const BUILD_ID = '2026-10-06.103';
+const BUILD_ID = '2026-10-06.113';
 
 // 系统默认密钥自动轮换参数
 const ROTATE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000; // 轮换周期：7 天
@@ -223,7 +223,7 @@ async function getAppConfig(env) {
 				// 一个账号都没有则视为纯第三方模式，默认关闭账号池
 				cfPoolEnabled: typeof data.cfPoolEnabled === 'boolean' ? data.cfPoolEnabled : accounts.length > 0,
 				defaultProviderId: typeof data.defaultProviderId === 'string' ? data.defaultProviderId : '',
-				// 配额组：一组「同一用途的候选模型 + 各自的次数上限」，按顺序自动切换到未满的那个
+				// 配额组：一组「同一用途的候选模型 + 各自的配额上限」（按次数或 token），按负载自动分摊、报错自动换成员
 				quotaGroups: Array.isArray(data.quotaGroups) ? data.quotaGroups : [],
 				// 系统默认密钥：自动轮换相关字段（老配置缺省时按安全默认值补齐）
 				systemKeyRotationEnabled: typeof data.systemKeyRotationEnabled === 'boolean' ? data.systemKeyRotationEnabled : false,
@@ -449,20 +449,31 @@ function fmtInOffset(ms, offsetMin) {
 	return new Date(Number(ms) + Number(offsetMin || 0) * 60000).toISOString().slice(0, 16).replace('T', ' ');
 }
 
+// 某年某月「第 day 日」的本地基准毫秒（该月没这一天时落到当月最后一天）。
+// ⚠️ 绝不能直接写 Date.UTC(y, m, 31) —— 短月会**进位到次月**（2 月 31 日 → 3 月 3 日），
+// 周期窗口会整段错位却完全不报错。必须显式与「当月最后一天」取 min。
+function monthAnchorLocal(y, m, day, resetMin) {
+	const lastDay = new Date(Date.UTC(y, m + 1, 0)).getUTCDate();
+	const dd = Math.min(Math.max(1, Math.floor(day) || 1), lastDay);
+	return Date.UTC(y, m, dd) + resetMin * 60000;
+}
+
 // 当前配额的周期窗口，返回统计桶的半开区间 [startKey, endKey)
 function quotaWindow(group, nowMs) {
 	const offsetMin = resolveResetOffset(group);
 	const resetMin = parseResetTime(group && group.resetLocalTime);
 	const isMonth = !!(group && group.period === 'month');
+	// 月内重置日：1-31。老组没有该字段 → 缺省 1 → 行为与改造前完全一致（零迁移）。
+	const resetDay = Math.max(1, Math.min(31, Math.floor(Number(group && group.resetDay)) || 1));
 	// 先把时间平移到该时区的「墙上时间」，之后一律用 UTC getter 读 —— 等价于读本地时间，
 	// 但不依赖运行时的本机时区设置（Workers 恒为 UTC）。
 	const localMs = Number(nowMs) + offsetMin * 60000;
 	const d = new Date(localMs);
 	let startLocal;
 	if (isMonth) {
-		// 本月 1 日的基准时刻；还没到就把窗口退回上个月
-		startLocal = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1) + resetMin * 60000;
-		if (startLocal > localMs) startLocal = Date.UTC(d.getUTCFullYear(), d.getUTCMonth() - 1, 1) + resetMin * 60000;
+		// 本月「第 resetDay 日」的基准时刻；还没到就把窗口退回上个月（上月同样按 resetDay 取）
+		startLocal = monthAnchorLocal(d.getUTCFullYear(), d.getUTCMonth(), resetDay, resetMin);
+		if (startLocal > localMs) startLocal = monthAnchorLocal(d.getUTCFullYear(), d.getUTCMonth() - 1, resetDay, resetMin);
 	} else {
 		// 该时区当天的基准时刻；还没到就退回昨天
 		startLocal = Math.floor(localMs / 86400000) * 86400000 + resetMin * 60000;
@@ -470,7 +481,7 @@ function quotaWindow(group, nowMs) {
 	}
 	const sd = new Date(startLocal);
 	const endLocal = isMonth
-		? Date.UTC(sd.getUTCFullYear(), sd.getUTCMonth() + 1, 1) + resetMin * 60000
+		? monthAnchorLocal(sd.getUTCFullYear(), sd.getUTCMonth() + 1, resetDay, resetMin)
 		: startLocal + 86400000;
 	const startMs = startLocal - offsetMin * 60000;
 	const endMs = endLocal - offsetMin * 60000;
@@ -488,7 +499,8 @@ function quotaWindow(group, nowMs) {
 
 // 组的重置基准的人类可读描述，界面直接用
 function describeReset(group) {
-	const period = group && group.period === 'month' ? '每月 1 日' : '每天';
+	const resetDay = Math.max(1, Math.min(31, Math.floor(Number(group && group.resetDay)) || 1));
+	const period = group && group.period === 'month' ? ('每月 ' + resetDay + ' 日') : '每天';
 	const time = String((group && group.resetLocalTime) || '00:00');
 	const key = group && group.resetTz ? String(group.resetTz) : 'utc';
 	let tz;
@@ -504,9 +516,16 @@ function describeReset(group) {
 	return period + ' ' + time + ' · ' + tz;
 }
 
-// 查一组配额成员的「本周期已用次数」。周期边界由组自己的重置时区/时刻决定。
-// 返回 Map<JSON[providerId, model], used>；返回 null 表示算不出来（未绑 D1 / 查询失败）——
-// 调用方必须区分 null 和 0。
+// 从一个用量条目里按计量单位取值。条目形如 {count, tokens}（见 queryQuotaUsage 的 SQL）。
+// unit==='token' → token 总量；其它（含缺省）→ 请求条数。条目缺失时返回 0。
+function quotaMeterOf(entry, unit) {
+	if (!entry) return 0;
+	return unit === 'token' ? (Number(entry.tokens) || 0) : (Number(entry.count) || 0);
+}
+
+// 查一组配额成员的「本周期已用量」。周期边界由组自己的重置时区/时刻决定。
+// 返回 Map<JSON[providerId, model], {count, tokens}>；返回 null 表示算不出来（未绑 D1 / 查询失败）——
+// 调用方必须区分 null 和 0。两种计量一次查出（只多一列、往返次数不变），由成员自己的 unit 决定用哪个。
 async function queryQuotaUsage(env, group, members) {
 	if (!env.DB) return null;
 	await ensureStatsTable(env);
@@ -528,14 +547,20 @@ async function queryQuotaUsage(env, group, members) {
 	// req + probe_req：把「测试连通 / 测模型」这类探测调用也算进配额。
 	// 上游是按总请求数算额度的，测试同样消耗它 —— 不合并的话会出现
 	// 「测试把额度用掉了，配额却还显示有剩余」的假象。
-	const sql = `SELECT provider_id, model, COALESCE(SUM(req + probe_req), 0) AS used FROM stats
+	const sql = `SELECT provider_id, model,
+	     COALESCE(SUM(req + probe_req), 0) AS used_count,
+	     COALESCE(SUM(tokens), 0) AS used_tokens
+	   FROM stats
 	   WHERE day >= ? AND day < ? AND provider_id IN (${placeholders})
 	   GROUP BY provider_id, model`;
 	try {
 		const { results } = await env.DB.prepare(sql).bind(win.startKey, win.endKey, ...ids).all();
 		const out = new Map();
 		for (const r of results || []) {
-			out.set(JSON.stringify([String(r.provider_id), String(r.model)]), Number(r.used) || 0);
+			out.set(JSON.stringify([String(r.provider_id), String(r.model)]), {
+				count: Number(r.used_count) || 0,
+				tokens: Number(r.used_tokens) || 0
+			});
 		}
 		// 只缓存成功结果，失败(null)不缓存，避免瞬时故障被放大
 		if (ttl > 0) quotaQueryCache.set(cacheKey, { expiry: now + ttl, value: out });
@@ -555,7 +580,13 @@ async function queryQuotaUsage(env, group, members) {
 
 const QUOTA_COOLDOWN_429_MS = 60000; // 429 限流：冷却 60s（上游给了 retry_after 就取更长的）
 const QUOTA_COOLDOWN_ERR_MS = 30000; // 5xx / 超时 / 连不上：冷却 30s
-const QUOTA_COOLDOWN_MAX_MS = 600000; // 冷却上限 10 分钟（防被上游的超长 retry_after 卡死）
+// 「额度耗尽」类错误（402 余额不足 / 429+insufficient_quota / RESOURCE_EXHAUSTED）：
+// 这类失败**不会**在几十秒后自愈 —— 要等配额周期重置（一天/一月）。若仍按 60s 冷却，
+// 调度器会反复回头撞同一堵墙：每次都白失败一次、冷却期内还用不了它。
+// 故给一个远长于瞬时错误的冷却。⚠️ QUOTA_COOLDOWN_MAX_MS 必须 >= 此值，
+// 否则 setCooldown 里的 Math.min 会把它截断回上限。
+const QUOTA_COOLDOWN_QUOTA_MS = 30 * 60 * 1000; // 额度/余额耗尽：冷却 30 分钟
+const QUOTA_COOLDOWN_MAX_MS = 1800000; // 冷却上限 30 分钟（防被上游的超长 retry_after 卡死）
 const QUOTA_MAX_SWITCH = 3; // 一次请求内最多尝试几个成员（含第一个）
 // 瞬时基础设施错误（5xx / 超时 / 连不上）的「原地重试」次数。
 // 现实依据（2026-10-06 直连 Google 实测）：gemini-3.1-flash-lite 会间歇性返回
@@ -564,7 +595,10 @@ const QUOTA_MAX_SWITCH = 3; // 一次请求内最多尝试几个成员（含第�
 // 只在「没有别的成员可换」时才用（非配额组请求，或第一个成员且无备选），避免放大故障时的请求量。
 const PROVIDER_TRANSIENT_RETRY = 1;
 const PROVIDER_TRANSIENT_RETRY_DELAY_MS = 500; // 重试前小睡一下，给上游喘息
-const QUOTA_HOUR_WEIGHT = 3; // 选号打分里「本小时已用」的权重（越大越避免短时扎堆）
+const QUOTA_HOUR_WEIGHT = 3; // 选号打分里「本小时已用比例」的权重（越大越避免短时扎堆）
+// 选号打分里「在途并发」的权重。打分主体已改成按「已用/上限」比例（量纲无关），
+// 而在途是个绝对计数，故折算成一个小比例项：1 个在途 ≈ 多用 5% 额度。
+const QUOTA_BUSY_WEIGHT = 0.05;
 const COOLDOWN_KV_KEY = 'cooldowns';
 
 // 冷却表：KV 存（跨 isolate 生效），isolate 内短缓存（省 KV 读）。
@@ -700,12 +734,22 @@ async function clearCooldown(env, providerId, model) {
 
 // 把上游失败分类：值不值得「换个成员重试」+ 冷却多久。
 // transient = 瞬时基础设施错误（5xx / 超时 / 连不上）→ 值得**原地再试一次**；
-//             429 / 401 / 403 不算（原地重试没用，得换成员或等冷却）。
+//             429 / 401 / 403 / 402 不算（原地重试没用，得换成员或等冷却）。
+// 冷却时长分两档：瞬时错误 30s / 429 限流 60s；**额度耗尽类 30 分钟**（不会自愈，见常量注释）。
 function classifyUpstreamFailure(result) {
 	const s = Number((result && (result.upstreamStatus || result.status)) || 0);
 	const msg = String((result && result.error) || '');
 	let out;
-	if (s === 429) out = { retryable: true, transient: false, coolMs: QUOTA_COOLDOWN_429_MS, reason: '上游 429 限流' };
+	// ★ 额度/余额耗尽优先判定：这类失败**必须换成员**，且要**长冷却**。
+	//   · 402 Payment Required —— OpenRouter 等「余额不足」走这个码；
+	//   · 429 但正文是额度语义 —— OpenAI 的 insufficient_quota、Gemini 的 RESOURCE_EXHAUSTED
+	//     都复用 429，光看状态码会误判成「限流 60s」，于是 60s 后又去撞（额度根本没恢复）。
+	//   注意：402 在改造前落进 `s >= 400` 分支 → retryable:false → **不换成员**，是明确的盲区。
+	const quotaExhausted = /insufficient_quota|resource_exhausted|exceeded your current quota|quota exceeded|billing/i.test(msg);
+	if (s === 402 || (s === 429 && quotaExhausted)) {
+		out = { retryable: true, transient: false, coolMs: QUOTA_COOLDOWN_QUOTA_MS, reason: `上游 ${s}（额度/余额已耗尽）` };
+	}
+	else if (s === 429) out = { retryable: true, transient: false, coolMs: QUOTA_COOLDOWN_429_MS, reason: '上游 429 限流' };
 	else if (s === 401 || s === 403) out = { retryable: true, transient: false, coolMs: QUOTA_COOLDOWN_ERR_MS, reason: `上游 ${s}（key 无效 / 无权限）` };
 	else if (s >= 500) out = { retryable: true, transient: true, coolMs: QUOTA_COOLDOWN_ERR_MS, reason: `上游 ${s}` };
 	else if (s >= 400) out = { retryable: false, transient: false, coolMs: 0, reason: `上游 ${s}（请求本身有问题，换成员也没用）` };
@@ -722,6 +766,7 @@ function classifyUpstreamFailure(result) {
 
 // 当前小时桶的用量（stats.day 形如 2026-10-04T07）——把请求在一小时内摊开，
 // 这正是「配额还有余额却 429」的解药：不靠精确限流，靠不扎堆。
+// 与 queryQuotaUsage 同口径：一次查出 count + tokens 两个维度，由成员自己的 unit 决定用哪个。
 async function queryQuotaHourUsage(env, members) {
 	if (!env.DB) return null;
 	await ensureStatsTable(env);
@@ -740,14 +785,20 @@ async function queryQuotaHourUsage(env, members) {
 			quotaQueryCache.delete(cacheKey); // 过期项顺手清，避免 Map 无限膨胀
 		}
 	}
-	const sql = `SELECT provider_id, model, COALESCE(SUM(req + probe_req), 0) AS used FROM stats
+	const sql = `SELECT provider_id, model,
+	     COALESCE(SUM(req + probe_req), 0) AS used_count,
+	     COALESCE(SUM(tokens), 0) AS used_tokens
+	   FROM stats
 	   WHERE day = ? AND provider_id IN (${placeholders})
 	   GROUP BY provider_id, model`;
 	try {
 		const { results } = await env.DB.prepare(sql).bind(hourKey, ...ids).all();
 		const out = new Map();
 		for (const r of results || []) {
-			out.set(JSON.stringify([String(r.provider_id), String(r.model)]), Number(r.used) || 0);
+			out.set(JSON.stringify([String(r.provider_id), String(r.model)]), {
+				count: Number(r.used_count) || 0,
+				tokens: Number(r.used_tokens) || 0
+			});
 		}
 		// 只缓存成功结果，失败(null)不缓存，避免瞬时故障被放大
 		if (ttl > 0) quotaQueryCache.set(cacheKey, { expiry: now + ttl, value: out });
@@ -833,7 +884,7 @@ async function pickQuotaMember(group, env, opts) {
 		if (!usage) {
 			return {
 				ok: false,
-				error: `配额组「${group.name}」的成员设了次数上限，但统计不到已用次数 —— `
+				error: `配额组「${group.name}」的成员设了上限，但统计不到已用量 —— `
 					+ '请在 Worker 上绑定 D1 数据库（变量名 DB）。未绑定时无法安全地按配额分流。'
 			};
 		}
@@ -841,23 +892,34 @@ async function pickQuotaMember(group, env, opts) {
 	// 本小时用量：把请求在一小时内摊开（拿不到就退化成只看本周期，不报错）。调度关掉时不查。
 	const hourUsage = sched ? await queryQuotaHourUsage(env, usable) : null;
 
+	// 计量单位：'token' = 按 token 总量，其它（缺省）= 按请求条数。
+	// 旧配置不带这个字段 → 一律当 'count'，语义与改造前完全一致（零迁移）。
+	const unitOf = (m) => (m.unit === 'token' ? 'token' : 'count');
+	// 打分的分母：有限成员用自己的 limit；「不限」成员（limit<=0）用组内最大 limit 做分母，
+	// 好让不限成员彼此仍可比。全组都不限时无分母 → 退化为绝对量比较（= 改造前行为）。
+	const maxLimit = usable.reduce((mx, m) => Math.max(mx, Number(m.limit) || 0), 0);
+
 	const rows = [];
 	for (const m of usable) {
 		const k = JSON.stringify([String(m.providerId), String(m.model)]);
 		const limit = Number(m.limit) || 0;
-		const used = usage ? (usage.get(k) || 0) : 0;
+		const unit = unitOf(m);
+		const used = usage ? quotaMeterOf(usage.get(k), unit) : 0;
 		if (limit > 0 && used >= limit) continue; // 本周期已满 → 硬性剔除
-		const hour = hourUsage ? (hourUsage.get(k) || 0) : 0;
+		const hour = hourUsage ? quotaMeterOf(hourUsage.get(k), unit) : 0;
 		const busy = inflight ? (inflight.get(m._key) || 0) : 0;
-		rows.push({ m, limit, used, hour, busy, rnd: Math.random() });
+		rows.push({ m, limit, unit, used, hour, busy, rnd: Math.random() });
 	}
 
 	if (!rows.length) {
 		const detail = usable.map(m => {
 			const limit = Number(m.limit) || 0;
+			const unit = unitOf(m);
 			if (limit <= 0) return `${m.model} 不限`;
-			const used = usage ? (usage.get(JSON.stringify([String(m.providerId), String(m.model)])) || 0) : 0;
-			return `${m.providerName}/${m.model} ${used}/${limit}`;
+			const used = usage
+				? quotaMeterOf(usage.get(JSON.stringify([String(m.providerId), String(m.model)])), unit)
+				: 0;
+			return `${m.providerName}/${m.model} ${used}/${limit}${unit === 'token' ? ' token' : ' 次'}`;
 		}).join('，');
 		const win = quotaWindow(group, Date.now());
 		return {
@@ -882,11 +944,19 @@ async function pickQuotaMember(group, env, opts) {
 		if (hit) return { ok: true, providerId: hit.m.providerId, model: hit.m.model, used: hit.used, limit: hit.limit, sticky: true };
 	}
 
-	// 负载均衡排序：本小时已用(带权重) + 在途 → 本周期已用 → 随机
-	rows.sort((a, b) =>
-		((a.hour + a.busy) * QUOTA_HOUR_WEIGHT) - ((b.hour + b.busy) * QUOTA_HOUR_WEIGHT)
-		|| a.used - b.used
-		|| a.rnd - b.rnd);
+	// 负载均衡排序：按「消耗比例」而非绝对量 —— 组内成员可能一个按次数、一个按 token，
+	// 上限也各不相同（50 万 vs 500 万），绝对量根本不可比。
+	//   score = 本小时消耗比例 × 权重 + 本周期消耗比例 + 在途并发 × 小权重
+	//   · 有限成员：比例 = 已用 / 自己的上限
+	//   · 不限成员：本周期比例恒为 0（优先——先把不限额度的用掉），小时比例用组内最大上限做分母
+	//   · 全组都不限：小时比例退化为绝对量，与改造前的 (hour+busy)*3 → used 行为等价
+	const scoreOf = (r) => {
+		const usedRatio = r.limit > 0 ? r.used / r.limit : 0;
+		const hourRatio = r.limit > 0 ? r.hour / r.limit
+			: (maxLimit > 0 ? r.hour / maxLimit : r.hour);
+		return hourRatio * QUOTA_HOUR_WEIGHT + usedRatio + r.busy * QUOTA_BUSY_WEIGHT;
+	};
+	rows.sort((a, b) => scoreOf(a) - scoreOf(b) || a.rnd - b.rnd);
 	const pick = rows[0];
 	return { ok: true, providerId: pick.m.providerId, model: pick.m.model, used: pick.used, limit: pick.limit };
 }
@@ -4894,7 +4964,7 @@ async function handleDashboardApi(request, env, ctx) {
 		}
 	}
 
-	// 12. 配额组：一组候选模型 + 各自的次数上限，按顺序自动切换到未满的那个
+	// 12. 配额组：一组候选模型 + 各自的配额上限（按次数或 token），按负载自动分摊、报错自动换成员
 	if (url.pathname === '/api/quota-groups') {
 		if (method === 'GET') {
 			// 配置与冷却表互不依赖 → 并行读（原来串行 = 2 次往返）
@@ -4932,9 +5002,10 @@ async function handleDashboardApi(request, env, ctx) {
 							providerName: p ? p.name : '',
 							providerMissing: !p,
 							providerDisabled: !!(p && p.status === 'disabled'),
-							// null 表示统计不可用（未绑 D1），界面要区分「0 次」和「算不出来」
-							used: map ? (map.get(k) || 0) : null,
-							hourUsed: hourMap ? (hourMap.get(k) || 0) : null,
+							// null 表示统计不可用（未绑 D1），界面要区分「0」和「算不出来」
+							// 成员的 unit 决定取哪个口径：'token' 取 token 总量，否则取请求条数
+							used: map ? quotaMeterOf(map.get(k), m.unit) : null,
+							hourUsed: hourMap ? quotaMeterOf(hourMap.get(k), m.unit) : null,
 							cooldownLeft: cdLeft,
 							cooldownReason: cdLeft ? (cd.reason || '上游报错') : '',
 							limit: Number(m.limit) || 0
@@ -4983,7 +5054,7 @@ async function handleDashboardApi(request, env, ctx) {
 					const n = Number(rawLimit);
 					if (!Number.isFinite(n) || n < 0) {
 						return new Response(JSON.stringify({
-							error: `成员「${model}」的配额上限不是合法数字：${JSON.stringify(rawLimit)}（留空或 0 表示不限次数）`
+							error: `成员「${model}」的配额上限不是合法数字：${JSON.stringify(rawLimit)}（留空或 0 表示不限）`
 						}), { status: 400, headers: { 'Content-Type': 'application/json' } });
 					}
 					limit = Math.floor(n);
@@ -4991,7 +5062,9 @@ async function handleDashboardApi(request, env, ctx) {
 				const memberKey = providerId + '\u0000' + model;
 				if (seenMemberKeys.has(memberKey)) continue;   // 同渠道同模型只保留第一条
 				seenMemberKeys.add(memberKey);
-				members.push({ providerId, model, limit, status: m.status === 'disabled' ? 'disabled' : 'active' });
+				// 计量单位只认白名单 'token'，其余（含缺省）一律 'count' —— 兼容旧配置语义
+				const unit = m.unit === 'token' ? 'token' : 'count';
+				members.push({ providerId, model, limit, unit, status: m.status === 'disabled' ? 'disabled' : 'active' });
 			}
 
 			if (!members.length) {
@@ -5013,6 +5086,8 @@ async function handleDashboardApi(request, env, ctx) {
 				resetTz: Object.prototype.hasOwnProperty.call(RESET_TZ_PRESETS, resetTzKey) ? resetTzKey : 'utc',
 				resetLocalTime: normalizeResetTime(body.resetLocalTime),
 				resetTzOffset: Math.max(-840, Math.min(840, Math.round(Number(body.resetTzOffset) || 0))),
+				// 月内重置日（仅 period=month 有意义）：缺省 1；非数字回落到 1，数字按 1-31 截断
+				resetDay: Math.max(1, Math.min(31, Math.floor(Number(body.resetDay)) || 1)),
 				// 会话粘性：同一会话尽量固定同一个成员（多轮/工具调用更稳）；默认开（未设置即视为开）
 				sticky: body.sticky !== false,
 				members
@@ -6392,11 +6467,17 @@ async function handleAdminPage(request, env, ctx) {
 	const pageEtag = '"ad-' + BUILD_ID + '-' + (cfEnabled ? 'cf' : 'ncf') + '"';
 	if (etagMatches(request, pageEtag)) return new Response(null, { status: 304, headers: htmlCacheHeaders(pageEtag) });
 
-	// 配额组「重置基准」的时区下拉。offset 挂在 data-offset 上，前端的实时换算直接读它，
-	// 不用再往页面里注一份数据。
-	const resetTzOptions = Object.keys(RESET_TZ_PRESETS).map(function (k) {
+	// 配额组「重置基准」的时区**预设项**（点输入框右侧箭头展开，在下方平铺）。
+	// 演变过程（2026-10-08，都是被实测逼出来的）：
+	//   ① 原生 <datalist> —— 面板由浏览器渲染，**宽度不受 CSS 控制**，做不出「与输入框对齐」；
+	//   ② 自建下拉「下方不够就向上弹」—— 结果盖住了上面的字段，看着乱；
+	//   ③ 现在这版 —— 菜单**只向下展开**（内容区可滚动，展开后自动滚到可见），绝不遮挡。
+	// · data-value 用可读 label —— 用户看到和打字的都是「北京时间 UTC+8」这种文本；
+	// · data-key 供前端把文本反查回预设键；data-offset 供实时换算读；
+	// · custom 不列 —— 自定义偏移改用「直接输入数字」表达（如 480 / -420）。
+	const resetTzMenu = Object.keys(RESET_TZ_PRESETS).filter(function (k) { return k !== 'custom'; }).map(function (k) {
 		const p = RESET_TZ_PRESETS[k];
-		return '<option value="' + k + '" data-offset="' + (p.offset === null ? '' : p.offset) + '">' + p.label + '</option>';
+		return '<button type="button" class="quota-combo-item" data-value="' + p.label + '" data-key="' + k + '" data-offset="' + (p.offset === null ? '' : p.offset) + '">' + p.label + '</button>';
 	}).join('');
 
 	const html = `<!DOCTYPE html>
@@ -7037,6 +7118,77 @@ async function handleAdminPage(request, env, ctx) {
 
 		:root[data-theme="light"] input:focus {
 			background-color: rgba(255, 255, 255, 0.95);
+		}
+
+		/* 配额组的「预设下拉」——输入框右侧一个独立箭头，点开在下方平铺预设。
+		   刻意**只向下展开**：向上弹会盖住相邻字段（2026-10-08 用户实测否掉）。
+		   也刻意不用原生 <datalist>：它的面板宽度不受 CSS 控制，做不出与输入框对齐。 */
+		.quota-combo {
+			position: relative;
+		}
+		.quota-combo-row {
+			display: flex;
+			gap: 8px;
+		}
+		.quota-combo-row input {
+			flex: 1 1 auto;
+			min-width: 0;
+		}
+		.quota-combo-toggle {
+			flex: none;
+			width: 42px;
+			border: 1px solid var(--input-border);
+			border-radius: 10px;
+			background-color: var(--input-bg);
+			color: var(--text-muted);
+			font-size: 12px;
+			cursor: pointer;
+		}
+		.quota-combo-toggle:hover {
+			border-color: var(--accent-color);
+			color: var(--text-main);
+		}
+		.quota-combo-menu {
+			display: none;
+			position: absolute;
+			left: 0;
+			right: 0;              /* 覆盖整行（输入框 + 箭头），左右与字段对齐 */
+			top: calc(100% + 4px); /* 只向下；不做向上翻转 */
+			max-height: 200px;
+			overflow-y: auto;
+			padding: 4px;
+			background-color: var(--card-bg);
+			border: 1px solid var(--border-color);
+			border-radius: 10px;
+			box-shadow: var(--card-shadow);
+			z-index: 40;
+			scrollbar-width: thin;
+		}
+		.quota-combo.open .quota-combo-menu {
+			display: block;
+		}
+		.quota-combo-item {
+			display: block;
+			width: 100%;
+			text-align: left;
+			padding: 9px 12px;
+			border: none;
+			border-radius: 8px;
+			background-color: transparent;
+			color: var(--text-main);
+			font-size: 13px;
+			font-family: inherit;
+			cursor: pointer;
+			white-space: nowrap;
+			overflow: hidden;
+			text-overflow: ellipsis;
+		}
+		.quota-combo-item:hover {
+			background-color: var(--section-item-bg);
+		}
+		/* 当前值对应的那项高亮 —— 免得"点开发现第一项就是现在这个"让人困惑 */
+		.quota-combo-item.on {
+			color: var(--accent-color);
 		}
 
 		/* Buttons */
@@ -8143,7 +8295,7 @@ async function handleAdminPage(request, env, ctx) {
 								新建配额组
 							</button>
 						</div>
-						<div class="section-note">把一组「同一用途的候选模型」放进配额组，每个成员设一个次数上限（每天或每月）。默认按用量<b>自动分摊</b>，某个成员报错会<b>自动换下一个</b>并把它临时冷却。</div>
+						<div class="section-note">把一组「同一用途的候选模型」放进配额组，每个成员设一个上限（每天或每月），单位可选<b>次数</b>或 <b>token</b>。默认按消耗比例<b>自动分摊</b>（谁用得少用谁），某个成员报错会<b>自动换下一个</b>并把它临时冷却。</div>
 						<div class="hint-card collapsed" id="quota-hint">
 							<div class="hint-head" onclick="toggleHint('quota-hint')">
 								<span class="hint-arrow">▸</span>
@@ -8157,7 +8309,7 @@ async function handleAdminPage(request, env, ctx) {
 									<span class="hint-key">配映射</span>
 									<span class="hint-val">TT:组名</span>
 								</div>
-								<div class="hint-foot">已用次数复用调用统计里的数据，每个请求只多一次本地查询，<b>不会增加上游调用次数</b>。上限填 <code>0</code> 表示不限次数；<b>成员顺序只在用量相同时才决定优先</b>（不是固定顺位）—— 正常是「谁这一小时用得少用谁」。<br>重置时刻按组各自配置，默认 UTC 零点。用「基准时区 + 时刻」对齐上游的真实重置时间 —— 例如 Gemini 的每日配额在<b>太平洋时间午夜</b>重置，选「美国太平洋（夏令时）UTC-7」+ <code>00:00</code> 即可（换算成 UTC 07:00 / 北京时间 15:00）。</div>
+								<div class="hint-foot">已用量复用调用统计里的数据（按成员各自的单位：次数或 token），每个请求只多一次本地查询，<b>不会增加上游调用次数</b>。上限填 <code>0</code> 表示不限；<b>成员顺序只在消耗比例相同时才决定优先</b>（不是固定顺位）—— 正常是「谁这一小时用得少用谁」。<br>重置周期可填「每天」或「每月 N 日」（N 为 1-31，短月自动落到当月最后一天）；基准时区可直接打字选预设，也可填偏移分钟数（北京时间 = <code>480</code>）。<br>用它对齐上游的真实重置时间 —— 例如 Gemini 的每日配额在<b>太平洋时间午夜</b>重置：基准时区选「美国太平洋（夏令时）UTC-7」+ 重置时刻 <code>00:00</code> 即可（换算成 UTC 07:00 / 北京时间 15:00）。</div>
 							</div>
 						</div>
 						<div id="quota-sched-bar" style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 16px; padding: 12px 16px; border: 1px solid var(--border-color); border-radius: 12px; background: var(--section-item-bg);">
@@ -8169,7 +8321,7 @@ async function handleAdminPage(request, env, ctx) {
 							<button type="button" class="btn btn-secondary" id="quota-sched-clear" style="padding: 4px 10px; font-size: 11px; border-radius: 6px; display: none;" onclick="clearQuotaCooldowns()">解除全部冷却</button>
 						</div>
 						<div id="quota-d1-warning" class="hidden" style="background-color: rgba(245, 158, 11, 0.1); border: 1px solid rgba(245, 158, 11, 0.2); padding: 14px 16px; border-radius: 12px; font-size: 13px; color: var(--warning-color); line-height: 1.6; margin-top: 16px;">
-							<strong>注意：</strong> 未绑定 D1 数据库（变量名 <code>DB</code>），配额组无法统计已用次数。设了次数上限的组会<b>直接报错</b>，不会静默放行。请到 Worker → Settings → Bindings 添加 D1。
+							<strong>注意：</strong> 未绑定 D1 数据库（变量名 <code>DB</code>），配额组无法统计已用量（次数 / token）。设了上限的组会<b>直接报错</b>，不会静默放行。请到 Worker → Settings → Bindings 添加 D1。
 						</div>
 						<div id="quota-groups-list" style="margin-top: 20px;"></div>
 					</div>
@@ -8435,7 +8587,7 @@ async function handleAdminPage(request, env, ctx) {
 					</tbody>
 				</table>
 				<div class="section-note">逐个向该渠道发一句 ping。结果会记在渠道上，渠道列表里模型名前面的圆点即为最近一次结果（灰=未测、绿=正常、红=失败）。单次最多测 12 个模型。</div>
-				<div style="background-color: rgba(245, 158, 11, 0.1); border: 1px solid rgba(245, 158, 11, 0.2); padding: 12px 14px; border-radius: 10px; font-size: 12.5px; color: var(--warning-color); line-height: 1.6; margin-top: 12px;"><strong>注意：</strong>测试会<b>真实调用上游</b> —— 既消耗上游额度，也会计入「调用配额」的已用次数。上游是按总请求数算额度的，测试同样占额度，所以别频繁点。</div>
+				<div style="background-color: rgba(245, 158, 11, 0.1); border: 1px solid rgba(245, 158, 11, 0.2); padding: 12px 14px; border-radius: 10px; font-size: 12.5px; color: var(--warning-color); line-height: 1.6; margin-top: 12px;"><strong>注意：</strong>测试会<b>真实调用上游</b> —— 既消耗上游额度，也会计入「调用配额」的已用量。上游是按总请求数算额度的，测试同样占额度，所以别频繁点。</div>
 			</div>
 			<div class="modal-footer">
 				<button class="btn btn-secondary" onclick="closeProviderHealthModal()">关闭</button>
@@ -8520,10 +8672,21 @@ async function handleAdminPage(request, env, ctx) {
 					</div>
 					<div class="form-group">
 						<label for="quota-period">重置周期</label>
-						<select id="quota-period" onchange="updateQuotaResetPreview()">
-							<option value="day">每天</option>
-							<option value="month">每月 1 日</option>
-						</select>
+						<div class="quota-combo" id="quota-period-combo">
+							<div class="quota-combo-row">
+								<input type="text" id="quota-period" autocomplete="off"
+									placeholder="留空 = 每天；或自定义日期"
+									oninput="updateQuotaResetPreview()" onkeydown="quotaComboKey(event, 'quota-period')">
+								<button type="button" class="quota-combo-toggle" title="展开预设"
+									onclick="quotaComboToggle('quota-period')">▾</button>
+							</div>
+							<div class="quota-combo-menu" id="quota-period-menu">
+								<button type="button" class="quota-combo-item" data-value="每天">每天</button>
+								<button type="button" class="quota-combo-item" data-value="每月 1 日">每月 1 日</button>
+								<button type="button" class="quota-combo-item" data-value="每月 15 日">每月 15 日</button>
+								<button type="button" class="quota-combo-item" data-value="每月 25 日">每月 25 日</button>
+							</div>
+						</div>
 					</div>
 					<div class="form-group">
 						<label for="quota-reset-time">重置时刻（该时区的本地时间）</label>
@@ -8531,26 +8694,28 @@ async function handleAdminPage(request, env, ctx) {
 					</div>
 					<div class="form-group">
 						<label for="quota-reset-tz">基准时区</label>
-						<select id="quota-reset-tz" onchange="toggleQuotaCustomOffset(); updateQuotaResetPreview();">
-							${resetTzOptions}
-						</select>
+						<div class="quota-combo" id="quota-reset-tz-combo">
+							<div class="quota-combo-row">
+								<input type="text" id="quota-reset-tz" autocomplete="off"
+									placeholder="留空 = UTC；或自定义偏移"
+									oninput="updateQuotaResetPreview()" onkeydown="quotaComboKey(event, 'quota-reset-tz')">
+								<button type="button" class="quota-combo-toggle" title="展开预设"
+									onclick="quotaComboToggle('quota-reset-tz')">▾</button>
+							</div>
+							<div class="quota-combo-menu" id="quota-reset-tz-menu">${resetTzMenu}</div>
+						</div>
 					</div>
-				</div>
-
-				<div class="form-group" id="quota-offset-wrap" style="display: none;">
-					<label for="quota-reset-offset">自定义偏移（分钟；北京时间 = 480，太平洋夏令时 = -420）</label>
-					<input type="number" id="quota-reset-offset" value="0" oninput="updateQuotaResetPreview()">
 				</div>
 
 				<div id="quota-reset-preview" style="font-size: 12px; color: var(--text-muted); line-height: 1.6;"></div>
 
 				<div style="display: flex; align-items: center; justify-content: space-between;">
-					<span style="font-size: 13px; color: var(--text-muted);">成员 —— 按负载自动分摊（谁用得少用谁），某个成员报错会自动换下一个</span>
+					<span style="font-size: 13px; color: var(--text-muted);">成员 —— 按消耗比例自动分摊（谁用得少用谁），某个成员报错会自动换下一个</span>
 					<button class="btn btn-secondary" onclick="addQuotaMemberRow()" style="padding: 6px 12px; font-size: 12px;">添加成员</button>
 				</div>
 
-				<div style="display: grid; grid-template-columns: 1.2fr 1.6fr 90px 76px 34px; gap: 8px; font-size: 12px; color: var(--text-muted);">
-					<span>渠道</span><span>上游模型名</span><span>次数上限</span><span>状态</span><span></span>
+				<div style="display: grid; grid-template-columns: 1.2fr 1.5fr 86px 78px 72px 34px; gap: 8px; font-size: 12px; color: var(--text-muted);">
+					<span>渠道</span><span>上游模型名</span><span>上限</span><span>单位</span><span>状态</span><span></span>
 				</div>
 				<div id="quota-members" style="display: flex; flex-direction: column; gap: 10px;"></div>
 
@@ -9209,7 +9374,7 @@ async function handleAdminPage(request, env, ctx) {
 			access: ['接入信息', '把客户端接到这个代理上，点击地址即可复制'],
 			providers: ['第三方渠道', '接入任意 OpenAI 兼容端点，按模型名分流'],
 			settings: ['模型映射', '决定某个模型名最终走哪一个上游'],
-			quota: ['调用配额', '给一组候选模型设次数上限，用满自动切换到下一个']
+			quota: ['调用配额', '给一组候选模型设上限（次数或 token），按比例分摊、用满自动切换']
 		};
 
 		function applyTabMeta(tabName) {
@@ -10694,12 +10859,16 @@ async function handleAdminPage(request, env, ctx) {
 		// 单个成员的展示单元：进度条 / 用量文字 / 状态徽标。
 		// 已用次数拿不到时（未绑 D1）必须显式区分，不能当成 0 —— 否则会误判成"还有很多额度"。
 		function quotaUsedCell(m, period) {
-			const unit = period === 'month' ? '本月' : '今日';
+			// 注意：这里的 periodLabel 是「时间段」（本月/今日），与「计量单位」是两回事 —— 别混用。
+			const periodLabel = period === 'month' ? '本月' : '今日';
+			// 计量单位：成员设了 token 就显示 token，否则「次」—— 必须与调度实际口径一致，
+			// 否则设成 token 的成员在卡片上仍写着「次」，用户会以为配额没生效（2026-10-08 实际反馈）。
+			const meter = m.unit === 'token' ? 'token' : '次';
 			const limit = Number(m.limit) || 0;
 			// 本小时用量 = 负载均衡的依据，顺手展示（统计没启用时不显示）
 			const hourTxt = (m.hourUsed === null || m.hourUsed === undefined)
 				? ''
-				: '<span style="color: var(--text-muted); margin-left: 6px;">本小时 ' + Number(m.hourUsed) + ' 次</span>';
+				: '<span style="color: var(--text-muted); margin-left: 6px;">本小时 ' + Number(m.hourUsed) + ' ' + meter + '</span>';
 			// 冷却中优先展示：这是「上游报错 → 临时踢出调度」的状态，必须看得见
 			if (Number(m.cooldownLeft) > 0) {
 				const secs = Number(m.cooldownLeft);
@@ -10715,7 +10884,7 @@ async function handleAdminPage(request, env, ctx) {
 			if (m.providerDisabled) return { bar: '', right: '<span style="color: var(--text-muted);">所在渠道已停用</span>' + hourTxt, badge: '<span class="badge badge-warning">跳过</span>' };
 			if (m.status === 'disabled') return { bar: '', right: '<span style="color: var(--text-muted);">已手动停用</span>' + hourTxt, badge: '<span class="badge badge-warning">停用</span>' };
 			if (limit <= 0) {
-				const t = m.used === null ? '不限次数（统计未启用）' : '不限次数 · ' + unit + '已用 ' + m.used + ' 次';
+				const t = m.used === null ? '不限（统计未启用）' : '不限 · ' + periodLabel + '已用 ' + m.used + ' ' + meter;
 				return { bar: '', right: '<span style="color: var(--text-muted);">' + t + '</span>' + hourTxt, badge: '<span class="badge badge-info">不限</span>' };
 			}
 			if (m.used === null) {
@@ -10726,7 +10895,7 @@ async function handleAdminPage(request, env, ctx) {
 			const color = used >= limit ? 'var(--danger-color)' : (pct >= 80 ? 'var(--warning-color)' : 'var(--success-color)');
 			const bar = '<div style="height:6px; border-radius:3px; background: var(--border-color); overflow:hidden;"><div style="height:100%; width:' + pct + '%; background:' + color + ';"></div></div>';
 			const right = '<span style="font-weight:500;">' + used + ' / ' + limit + '</span>'
-				+ '<span style="color: var(--text-muted); margin-left: 6px;">剩 ' + Math.max(0, limit - used) + ' 次</span>'
+				+ '<span style="color: var(--text-muted); margin-left: 6px;">剩 ' + Math.max(0, limit - used) + ' ' + meter + '</span>'
 				+ hourTxt;
 			const badge = used >= limit
 				? '<span class="badge badge-danger">已用满</span>'
@@ -10830,11 +10999,17 @@ async function handleAdminPage(request, env, ctx) {
 			const opts = ['<option value="">选择渠道…</option>'].concat(
 				providersCache.map(x => '<option value="' + sen(x.id) + '"' + (x.id === p.providerId ? ' selected' : '') + '>' + sen(x.name) + '</option>')
 			).join('');
-			return '<div class="quota-member-row" style="display: grid; grid-template-columns: 1.2fr 1.6fr 90px 76px 34px; gap: 8px; align-items: center;">'
+			// 计量单位：'token' = 按 token 总量，其它（缺省）= 按请求条数
+			const unit = p.unit === 'token' ? 'token' : 'count';
+			return '<div class="quota-member-row" style="display: grid; grid-template-columns: 1.2fr 1.5fr 86px 78px 72px 34px; gap: 8px; align-items: center;">'
 				+ '<select class="quota-m-provider" onchange="syncQuotaRowModels(this)" style="' + inputStyle + '">' + opts + '</select>'
 				+ '<input type="text" class="quota-m-model" list="' + rid + '-models" placeholder="下拉选，或手输" value="' + sen(p.model || '') + '" style="' + inputStyle + '">'
 				+ '<datalist id="' + rid + '-models"></datalist>'
 				+ '<input type="number" class="quota-m-limit" min="0" placeholder="0" value="' + (Number(p.limit) || 0) + '" style="' + inputStyle + '">'
+				+ '<select class="quota-m-unit" style="' + inputStyle + '">'
+				+ '<option value="count"' + (unit === 'count' ? ' selected' : '') + '>次数</option>'
+				+ '<option value="token"' + (unit === 'token' ? ' selected' : '') + '>token</option>'
+				+ '</select>'
 				+ '<select class="quota-m-status" style="' + inputStyle + '">'
 				+ '<option value="active"' + (p.status !== 'disabled' ? ' selected' : '') + '>启用</option>'
 				+ '<option value="disabled"' + (p.status === 'disabled' ? ' selected' : '') + '>停用</option>'
@@ -10870,23 +11045,171 @@ async function handleAdminPage(request, env, ctx) {
 			if (row) row.remove();
 		}
 
-		// ---- 重置基准：把「本地时刻 + 时区」实时换算成 UTC 几点，省得用户自己算 ----
-		function quotaResetOffsetMinutes() {
-			const sel = document.getElementById('quota-reset-tz');
-			if (!sel) return 0;
-			if (sel.value === 'custom') {
-				return Math.round(Number(document.getElementById('quota-reset-offset').value) || 0);
-			}
-			const opt = sel.options[sel.selectedIndex];
-			const v = opt ? Number(opt.dataset.offset) : 0;
-			return Number.isFinite(v) ? v : 0;
+		// ---- 配额组的「预设下拉」----
+		// 刻意**只向下展开**：向上弹会盖住相邻字段（2026-10-08 用户实测否掉）。
+		// 也刻意不用原生 <datalist>：它的面板宽度不受 CSS 控制，做不出与输入框对齐。
+		function quotaComboEls(inputId) {
+			return {
+				combo: document.getElementById(inputId + '-combo'),
+				input: document.getElementById(inputId),
+				menu: document.getElementById(inputId + '-menu')
+			};
 		}
 
-		function toggleQuotaCustomOffset() {
-			const sel = document.getElementById('quota-reset-tz');
-			const wrap = document.getElementById('quota-offset-wrap');
-			if (!sel || !wrap) return;
-			wrap.style.display = sel.value === 'custom' ? '' : 'none';
+		function quotaComboClose(inputId) {
+			const combo = document.getElementById(inputId + '-combo');
+			if (combo) combo.classList.remove('open');
+		}
+
+		function quotaComboCloseAll() {
+			['quota-period', 'quota-reset-tz'].forEach(quotaComboClose);
+		}
+
+		function quotaComboOpen(inputId) {
+			const { combo, menu, input } = quotaComboEls(inputId);
+			if (!combo || !menu) return;
+			quotaComboCloseAll();
+			combo.classList.add('open');
+			// 当前值对应的那项高亮 —— 免得"点开发现第一项就是现在这个"让人困惑。
+			// 输入框为空时按**默认值**高亮（周期默认「每天」、时区默认「UTC」），与实际生效的一致。
+			const fallback = inputId === 'quota-period' ? '每天' : 'UTC';
+			const cur = String((input && input.value) || '').trim() || fallback;
+			[].slice.call(menu.querySelectorAll('.quota-combo-item')).forEach(function (it) {
+				it.classList.toggle('on', it.dataset.value === cur);
+			});
+			// 展开后保证菜单整块可见（弹窗内容区可滚动）—— 这是「只向下弹」的配套，不会遮挡上面的字段
+			const body = combo.closest('.modal-body');
+			if (body) {
+				const mr = menu.getBoundingClientRect();
+				const br = body.getBoundingClientRect();
+				if (mr.bottom > br.bottom) body.scrollTop += (mr.bottom - br.bottom) + 8;
+			}
+		}
+
+		function quotaComboToggle(inputId) {
+			const combo = document.getElementById(inputId + '-combo');
+			if (combo && combo.classList.contains('open')) quotaComboClose(inputId);
+			else quotaComboOpen(inputId);
+		}
+
+		function quotaComboPick(inputId, value) {
+			const input = document.getElementById(inputId);
+			if (!input) return;
+			input.value = value;
+			quotaComboClose(inputId);
+			updateQuotaResetPreview();
+		}
+
+		function quotaComboKey(ev, inputId) {
+			if (ev.key === 'Escape') quotaComboClose(inputId);
+			else if (ev.key === 'ArrowDown') { ev.preventDefault(); quotaComboOpen(inputId); }
+		}
+
+		// 点预设项 → 填入；点别处 → 收起（事件委托，不给每项挂监听）
+		document.addEventListener('click', function (ev) {
+			const t = ev.target;
+			if (!t || !t.closest) return;
+			const item = t.closest('.quota-combo-item');
+			if (item) {
+				const menu = item.closest('.quota-combo-menu');
+				if (menu && menu.id) quotaComboPick(menu.id.replace(/-menu$/, ''), item.dataset.value);
+				return;
+			}
+			if (!t.closest('.quota-combo')) quotaComboCloseAll();
+		});
+
+		// ---- 重置基准：把「本地时刻 + 时区」实时换算成 UTC 几点，省得用户自己算 ----
+		// 偏移范围统一夹在 ±840 分钟（与服务端一致）
+		function clampOffsetMinutes(v) {
+			return Math.max(-840, Math.min(840, Math.round(Number(v) || 0)));
+		}
+
+		// 从前端自己的「建议列表」里查一项：先按可读名（value）精确匹配，再按预设键（data-key）兜底。
+		// ⚠️⚠️ 前端**绝不能**引用 Worker 顶层的时区预设常量 —— 那是服务端作用域的东西，浏览器里
+		//    根本没有，一引用就是 ReferenceError：openQuotaModal 直接抛错，
+		//    「新建 / 编辑配额组」按钮全部无反应（2026-10-08 实际踩过）。预设信息只能从 DOM 读。
+		function quotaTzOptionOf(text) {
+			const menu = document.getElementById('quota-reset-tz-menu');
+			if (!menu) return null;
+			const t = String(text == null ? '' : text).trim();
+			if (!t) return null;
+			const opts = [].slice.call(menu.querySelectorAll('.quota-combo-item'));
+			const exact = opts.find(function (o) { return o.dataset.value === t; })
+				|| opts.find(function (o) { return o.dataset.key === t; });
+			if (exact) return exact;
+			// 名字打不全时的宽容处理：**仅在该前缀唯一命中时**才认。
+			// 「北京时间」→ 唯一命中「北京时间 UTC+8」✓
+			// 「美国太平洋」→ 同时命中夏令时/冬令时两项 → 不认，让用户补全
+			//（宁可多打几个字，也不要静默猜错一个时区 —— 那会让配额在错误的时间重置）。
+			const byPrefix = opts.filter(function (o) { return String(o.dataset.value || '').indexOf(t) === 0; });
+			return byPrefix.length === 1 ? byPrefix[0] : null;
+		}
+
+		// 分钟偏移 → 'UTC+08:00' / 'UTC-07:30'：把自定义偏移显示成一眼可读的形式，
+		// 免得用户把「8」（8 分钟）误当成 UTC+8。
+		function fmtOffsetMinutes(min) {
+			const n = Math.round(Number(min) || 0);
+			const abs = Math.abs(n);
+			return 'UTC' + (n < 0 ? '-' : '+')
+				+ String(Math.floor(abs / 60)).padStart(2, '0') + ':' + String(abs % 60).padStart(2, '0');
+		}
+
+		// 基准时区输入 → { resetTz, resetTzOffset, offset, ok }
+		// 认三种写法：① 建议列表里的预设名或预设键  ② UTC+8 / GMT-7:30  ③ 纯数字分钟（480 = UTC+8）
+		// ⚠️ 正则一律用 [0-9] / [ ] 这类写法，别用反斜杠转义简写：内联脚本整体位于一个
+		//    模板字符串里，反斜杠会被吃掉（简写退化成普通字母），正则会静默失效且不报错（硬约定 #4）。
+		function parseQuotaTzInput(text) {
+			const t = String(text == null ? '' : text).trim();
+			// 留空 = 用默认 UTC（同理：新建时是空的）
+			if (!t) return { resetTz: 'utc', resetTzOffset: null, offset: 0, ok: true };
+			const um = t.match(/^(?:utc|gmt)[ ]*([+-])[ ]*([0-9]{1,2})(?::([0-9]{2}))?$/i);
+			if (um) {
+				const sign = um[1] === '-' ? -1 : 1;
+				const min = clampOffsetMinutes(sign * (Number(um[2]) * 60 + Number(um[3] || 0)));
+				return { resetTz: 'custom', resetTzOffset: min, offset: min, ok: true };
+			}
+			if (/^[+-]?[0-9]+$/.test(t)) {
+				const min = clampOffsetMinutes(Number(t));
+				return { resetTz: 'custom', resetTzOffset: min, offset: min, ok: true };
+			}
+			const opt = quotaTzOptionOf(t);
+			if (opt && opt.dataset.key) {
+				return { resetTz: opt.dataset.key, resetTzOffset: null, offset: Number(opt.dataset.offset) || 0, ok: true };
+			}
+			return { resetTz: 'utc', resetTzOffset: null, offset: 0, ok: false };
+		}
+
+		// 组配置 → 输入框该显示的文本（预设显示可读名；自定义偏移显示分钟数）
+		function quotaTzDisplay(group) {
+			const key = (group && group.resetTz) ? String(group.resetTz) : 'utc';
+			if (key !== 'custom') {
+				const opt = quotaTzOptionOf(key);
+				if (opt) return opt.dataset.value;
+				// 未知键：服务端按偏移 0 处理（等同 UTC），这里也照实显示 UTC，别显示成 "0"
+				return 'UTC';
+			}
+			return String(Number(group && group.resetTzOffset) || 0);
+		}
+
+		// 重置周期输入 → { period, resetDay, ok }
+		// 「每天」→ day；含 1-31 的数字 → 每月第 N 日；只说「每月」→ 每月 1 日
+		function parseQuotaPeriodInput(text) {
+			const t = String(text == null ? '' : text).trim();
+			// 留空 = 用默认「每天」。新建时输入框是空的，不能因此拦住保存
+			if (!t) return { period: 'day', resetDay: 1, ok: true };
+			if (/^(每天|每日|day|日)$/i.test(t)) return { period: 'day', resetDay: 1, ok: true };
+			const m = t.match(/([0-9]{1,2})/);
+			if (m) {
+				const d = Number(m[1]);
+				if (d >= 1 && d <= 31) return { period: 'month', resetDay: d, ok: true };
+				return { period: 'month', resetDay: 1, ok: false };
+			}
+			if (/^(每月|月|month|monthly)$/i.test(t)) return { period: 'month', resetDay: 1, ok: true };
+			return { period: 'day', resetDay: 1, ok: false };
+		}
+
+		function quotaResetOffsetMinutes() {
+			return Number(parseQuotaTzInput(document.getElementById('quota-reset-tz').value).offset) || 0;
 		}
 
 		function hhmm(min) {
@@ -10928,11 +11251,19 @@ async function handleAdminPage(request, env, ctx) {
 			const localMin = (Number(parts[0]) || 0) * 60 + (Number(parts[1]) || 0);
 			const off = quotaResetOffsetMinutes();
 			const utcMin = ((localMin - off) % 1440 + 1440) % 1440;
-			const tzSel = document.getElementById('quota-reset-tz');
-			const tzLabel = (tzSel && tzSel.options[tzSel.selectedIndex])
-				? String(tzSel.options[tzSel.selectedIndex].textContent || '').trim()
-				: 'UTC';
-			const period = document.getElementById('quota-period').value === 'month' ? '每月 1 日' : '每天';
+			// 时区已是自由输入：认得出来就显示原文，自定义偏移额外标出规范化写法
+			//（输入「8」其实是 8 分钟 → 标成 UTC+00:08，一眼就能看出不是 UTC+8）；
+			// 认不出来就明确标注会回落 UTC，不静默吞掉。
+			const tzRaw = String(document.getElementById('quota-reset-tz').value || '').trim();
+			const tzParsed = parseQuotaTzInput(tzRaw);
+			let tzLabel;
+			if (!tzRaw) tzLabel = 'UTC';
+			else if (!tzParsed.ok) tzLabel = tzRaw + '（无法识别 → 按 UTC）';
+			else if (tzParsed.resetTz === 'custom') tzLabel = tzRaw + '（' + fmtOffsetMinutes(tzParsed.offset) + '）';
+			else tzLabel = tzRaw;
+			const per = parseQuotaPeriodInput(document.getElementById('quota-period').value);
+			const period = !per.ok ? '（重置周期无法识别）'
+				: (per.period === 'month' ? ('每月 ' + per.resetDay + ' 日') : '每天');
 			// 这三行说的是同一个瞬间 —— 并排写出来，免得被当成三个不同的时间
 			el.textContent = '同一个时刻的三种写法：当地 ' + hhmm(localMin) + '（' + tzLabel + '）'
 				+ ' ＝ UTC ' + hhmm(utcMin)
@@ -10945,12 +11276,17 @@ async function handleAdminPage(request, env, ctx) {
 			const g = id ? quotaGroupsCache.find(x => x.id === id) : null;
 			document.getElementById('quota-id-edit').value = g ? g.id : '';
 			document.getElementById('quota-name').value = g ? g.name : '';
-			document.getElementById('quota-period').value = (g && g.period === 'month') ? 'month' : 'day';
-			document.getElementById('quota-reset-tz').value = (g && g.resetTz) ? g.resetTz : 'utc';
+			// 周期/时区：**新建时留空**，只在编辑时回显当前值。
+			// 之前新建会预填「每天」/「UTC」，用户每次都得先删掉才能填别的 —— 那个体验很烦
+			// （2026-10-08 用户明确反馈）。留空时的语义 = 用默认（每天 / UTC），见解析函数。
+			const resetDay = (g && Number(g.resetDay) > 0) ? Math.floor(Number(g.resetDay)) : 1;
+			document.getElementById('quota-period').value = g
+				? ((g.period === 'month') ? ('每月 ' + resetDay + ' 日') : '每天')
+				: '';
+			// 时区：预设显示它的可读名；自定义偏移直接显示分钟数
+			document.getElementById('quota-reset-tz').value = g ? quotaTzDisplay(g) : '';
 			document.getElementById('quota-reset-time').value = (g && g.resetLocalTime) ? g.resetLocalTime : '00:00';
-			document.getElementById('quota-reset-offset').value = (g && g.resetTzOffset) ? g.resetTzOffset : 0;
-			// 先设好值再切显隐/算预览，否则算的是上一次的状态
-			toggleQuotaCustomOffset();
+			// 先设好值再算预览，否则算的是上一次的状态
 			updateQuotaResetPreview();
 			updateQuotaNamePreview();
 			document.getElementById('quota-status-active').checked = g ? g.status !== 'disabled' : true;
@@ -10965,7 +11301,7 @@ async function handleAdminPage(request, env, ctx) {
 			syncAllQuotaRowModels();
 
 			document.getElementById('quota-modal-hint').textContent = providersCache.length
-				? '已用次数从调用统计里实时读取，不在这个弹窗里设置。上限填 0 表示不限次数。'
+				? '已用量从调用统计里实时读取，不在这个弹窗里设置。上限填 0 表示不限；单位按你填的数字口径选「次数」或「token」。'
 				: '还没有第三方渠道 —— 请先到「第三方渠道」添加一个，再回来配置配额组。';
 
 			document.getElementById('quota-modal').classList.add('active');
@@ -10981,18 +11317,26 @@ async function handleAdminPage(request, env, ctx) {
 				providerId: r.querySelector('.quota-m-provider').value,
 				model: r.querySelector('.quota-m-model').value.trim(),
 				limit: Math.max(0, Math.floor(Number(r.querySelector('.quota-m-limit').value) || 0)),
+				// 单位：只认 'token'，其余一律 'count'（与服务端白名单一致）
+				unit: (r.querySelector('.quota-m-unit') || {}).value === 'token' ? 'token' : 'count',
 				status: r.querySelector('.quota-m-status').value
 			})).filter(m => m.providerId && m.model);
 		}
 
 		async function saveQuotaGroup() {
+			// 周期 / 时区现在是自由输入 → 先解析；解析不出来就明确拦下，不静默兜底成别的语义
+			const per = parseQuotaPeriodInput(document.getElementById('quota-period').value);
+			const tz = parseQuotaTzInput(document.getElementById('quota-reset-tz').value);
+			if (!per.ok) { showToast('重置周期请填「每天」或「每月 N 日」（N 为 1-31）', 'warning'); return; }
+			if (!tz.ok) { showToast('基准时区请从建议列表选择，或直接填偏移分钟数（如 480 / -420）', 'warning'); return; }
 			const payload = {
 				name: document.getElementById('quota-name').value.trim(),
-				period: document.getElementById('quota-period').value,
+				period: per.period,
+				resetDay: per.resetDay,
 				status: document.getElementById('quota-status-active').checked ? 'active' : 'disabled',
-				resetTz: document.getElementById('quota-reset-tz').value,
+				resetTz: tz.resetTz,
 				resetLocalTime: document.getElementById('quota-reset-time').value || '00:00',
-				resetTzOffset: Math.round(Number(document.getElementById('quota-reset-offset').value) || 0),
+				resetTzOffset: tz.resetTz === 'custom' ? (Number(tz.resetTzOffset) || 0) : 0,
 				sticky: document.getElementById('quota-sticky').checked === true,
 				members: collectQuotaMembers()
 			};
