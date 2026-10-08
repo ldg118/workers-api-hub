@@ -10,7 +10,7 @@
 // ★★ 硬约定：**每次改动 _worker.js 都要把版本号 +1**（日期变了就用新日期、序号归 1）。
 //    格式固定 `YYYY-MM-DD.N`。验证脚本会拦下格式不对的值，但「有没有 +1」只能靠自觉 ——
 //    曾经因为版本号没变，本地/线上分不清哪个是哪版，白排查了一整轮。
-const BUILD_ID = '2026-10-06.83';
+const BUILD_ID = '2026-10-06.100';
 
 // 系统默认密钥自动轮换参数
 const ROTATE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000; // 轮换周期：7 天
@@ -194,7 +194,8 @@ const DEFAULT_CONFIG = {
 	systemApiKeyCreatedAt: null,
 	systemKeyRotationEnabled: false,
 	systemKeyRotatedAt: null,
-	systemApiKeyPrev: null
+	systemApiKeyPrev: null,
+	hiddenModels: []
 };
 
 async function getAppConfig(env) {
@@ -216,6 +217,8 @@ async function getAppConfig(env) {
 				apiKeys: Array.isArray(data.apiKeys) ? data.apiKeys : [],
 				customModelMap: (data.customModelMap && typeof data.customModelMap === 'object') ? data.customModelMap : { ...DEFAULT_MODEL_MAP },
 				providers: Array.isArray(data.providers) ? data.providers : [],
+				// 隐藏模型名单：用户在看板逐行「隐藏」后落入此处（B 方案）
+				hiddenModels: Array.isArray(data.hiddenModels) ? data.hiddenModels : [],
 				// 未显式设置过时：有 CF 账号就沿用「开启」（不静默改变现有部署的行为），
 				// 一个账号都没有则视为纯第三方模式，默认关闭账号池
 				cfPoolEnabled: typeof data.cfPoolEnabled === 'boolean' ? data.cfPoolEnabled : accounts.length > 0,
@@ -331,6 +334,25 @@ async function saveProviders(env, providers) {
 	const config = await getAppConfig(env);
 	config.providers = providers;
 	await saveAppConfig(env, config);
+}
+
+// 双向同步隐藏名单：toAdd 并入 config.hiddenModels（去重）；toRemove 从中移除（仅当已存在）。
+// 用于「从渠道移除模型→自动隐藏；重新加回渠道→自动恢复可见」的对称逻辑。
+// 调用方需自行完成跨渠道过滤（toAdd 只传确已不在任何渠道的孤儿；toRemove 传本次加回的模型）。
+async function applyHiddenModelChanges(env, toAdd, toRemove) {
+	if ((!toAdd || !toAdd.length) && (!toRemove || !toRemove.length)) return false;
+	const config = await getAppConfig(env);
+	const hidden = new Set(Array.isArray(config.hiddenModels) ? config.hiddenModels.map(String) : []);
+	let changed = false;
+	const addSet = new Set((toAdd || []).map(String).filter(Boolean));
+	const remSet = new Set((toRemove || []).map(String).filter(Boolean));
+	for (const m of addSet) { if (!hidden.has(m)) { hidden.add(m); changed = true; } }
+	for (const m of remSet) { if (hidden.has(m)) { hidden.delete(m); changed = true; } }
+	if (changed) {
+		config.hiddenModels = [...hidden];
+		await saveAppConfig(env, config);
+	}
+	return changed;
 }
 
 // 配额调度总开关（负载均衡 / 成员冷却 / 换成员重试）。默认开；关掉即回到旧行为。
@@ -885,10 +907,15 @@ async function saveRuntimeSettings(env, { cfPoolEnabled, defaultProviderId }) {
 // 管理员身份验证（同时支持 Cookie 和 Authorization 请求头）
 // ----------------------------------------------------
 // 登录令牌 = "<sha256(管理员密码)>.<过期时间戳>"。
-// 配合「会话 cookie」（不设 Max-Age）→ 关浏览器即失效；令牌再自带 1 小时上限，
-// 即使浏览器一直开着，超过 1 小时也会强制重新登录。
+// 登录 cookie 设 Max-Age=14400（4 小时）→ 持久化写盘：关窗口/关掉整个浏览器后，
+// 4 小时内重开仍是登录态；超过 4 小时（无论浏览器开没开）两端同时失效、强制重登。
+// 令牌内的 exp 与 Max-Age 对齐，避免出现「cookie 还在、服务器已拒」。
 // 旧的「裸哈希」cookie（无有效期）一律视为过期 → 强制重新登录。
-const ADMIN_SESSION_TTL_MS = 60 * 60 * 1000; // 最长登录有效期：1 小时
+const ADMIN_SESSION_TTL_MS = 4 * 60 * 60 * 1000; // 最长登录有效期：4 小时
+
+// 站点图标（favicon）：复刻落地页 .logo-icon —— 渐变圆角方块 + 白字 AI。
+// 内联 SVG data-URI，零外部请求；浏览器标签页/收藏夹显示用。
+const FAVICON_LINK = `<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%236366f1'/%3E%3Cstop offset='.5' stop-color='%23a855f7'/%3E%3Cstop offset='1' stop-color='%23ec4899'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='14' fill='url(%23g)'/%3E%3Ctext x='32' y='43' font-family='Arial,sans-serif' font-size='28' font-weight='700' fill='%23fff' text-anchor='middle'%3EAI%3C/text%3E%3C/svg%3E">`;
 
 function makeAdminSessionToken(hash) {
 	return hash + '.' + (Date.now() + ADMIN_SESSION_TTL_MS);
@@ -1707,7 +1734,7 @@ let publicProviderSummaryCache = null;
 
 // 第三方渠道统计：总览 + 按渠道（含各模型明细）
 // 数据全部来自本代理埋点，与 CF 官方账单是两条独立链路
-async function queryProviderStats(env, range) {
+async function queryProviderStats(env, range, includeInactive = false) {
 	if (!env.DB) return { enabled: false, reason: 'no-db' };
 	await ensureStatsTable(env);
 	// 第三方渠道「估算成本」单价（美元 / 千 token），纯示意估算，非真实账单。
@@ -1717,6 +1744,22 @@ async function queryProviderStats(env, range) {
 	// 单价来源优先级：① 渠道手填单价 → ② 上游 /models 缓存里的真实价（OpenRouter 等）→ ③ 全局粗估 estRate。
 	// 手填价让 Gemini / Agnes 这类上游不公开价格的渠道也能算得比较准。
 	const providersForPricing = await getProviders(env);
+	// 已停用/已删除的渠道不计入看板：删渠道只清映射、不动 stats 表，历史行仍留着；
+	// 这里在查询侧过滤，today/7d/all 一律默认隐藏。审计时传 includeInactive=1 才显示。
+	// 注意：若读不到渠道配置（haveConfig=false，如 KV 暂不可读），则不隐藏任何行——
+	// 宁可多显示、也不要把真实数据静默藏掉。
+	const provList = providersForPricing || [];
+	const haveConfig = provList.length > 0;
+	const providerIds = new Set(provList.map(p => String(p.id)));
+	const disabledIds = new Set(provList.filter(p => p.status === 'disabled').map(p => String(p.id)));
+	const isProviderVisible = (pid) => includeInactive || !haveConfig
+		|| (providerIds.has(String(pid)) && !disabledIds.has(String(pid)));
+
+	// 显式隐藏的模型（B 方案）：用户在看板逐行「隐藏」后落入 config.hiddenModels（模型名全局隐藏）。
+	// 与渠道隐藏同构逻辑——默认藏、includeInactive=1（含已停用渠道/隐藏模型）时一并显示，便于审计恢复。
+	const cfgHidden = await getAppConfig(env);
+	const hiddenModels = new Set(Array.isArray(cfgHidden.hiddenModels) ? cfgHidden.hiddenModels.map(String) : []);
+	const isModelVisible = (m) => includeInactive || !hiddenModels.has(String(m));
 	const manualPriceOf = (pid) => {
 		const p = (providersForPricing || []).find(x => x.id === String(pid));
 		const pr = p && p.pricing;
@@ -1758,25 +1801,25 @@ async function queryProviderStats(env, range) {
 	const args = sinceDay ? [sinceDay] : [];
 	const run = (stmt) => (sinceDay ? stmt.bind(...args) : stmt).all();
 
-	const totalsStmt = env.DB.prepare(
-		'SELECT COALESCE(SUM(req),0) AS req, COALESCE(SUM(ok),0) AS ok, COALESCE(SUM(fail),0) AS fail, COALESCE(SUM(ms_total),0) AS msTotal, COALESCE(SUM(probe_req),0) AS probeReq, COALESCE(SUM(probe_ok),0) AS probeOk, COALESCE(SUM(probe_fail),0) AS probeFail, COALESCE(SUM(probe_ms_total),0) AS probeMsTotal, COALESCE(SUM(tokens),0) AS tokens, COALESCE(SUM(reasoning_tokens),0) AS reasoningTokens, COALESCE(SUM(input_tokens),0) AS inputTokens, COALESCE(SUM(output_tokens),0) AS outputTokens FROM stats ' + where
-	);
-	const totalsRow = (await run(totalsStmt)).results?.[0] || {};
+	// 总览(summary)改由下方过滤后的 providerList 聚合得出，不再单独查全量 totalsStmt
+	// （这样「含已停用渠道」开关开启时，总览数字与明细始终一致）。
 
 	const rowsStmt = env.DB.prepare(
 		// MAX(last_at) + 裸列 last_ms：SQLite 规定裸列取自 MAX 命中的那一行 —— 即拿到「最近一次」的延迟
 		'SELECT provider_id, provider_name, model, SUM(req) AS req, SUM(ok) AS ok, SUM(fail) AS fail, SUM(ms_total) AS msTotal, SUM(probe_req) AS probeReq, SUM(probe_ok) AS probeOk, SUM(probe_fail) AS probeFail, SUM(probe_ms_total) AS probeMsTotal, SUM(tokens) AS tokens, SUM(reasoning_tokens) AS reasoningTokens, SUM(input_tokens) AS inputTokens, SUM(output_tokens) AS outputTokens, MAX(last_at) AS lastAt, last_ms AS lastMs FROM stats ' + where + ' GROUP BY provider_id, model ORDER BY req DESC'
 	);
-	const rows = (await run(rowsStmt)).results || [];
+	let rows = (await run(rowsStmt)).results || [];
+	if (!includeInactive) rows = rows.filter(r => isProviderVisible(r.provider_id) && isModelVisible(r.model));
 
 	// 图表数据①：近 7 日逐日逐模型 token（趋势折线，固定 7 天窗口，不受 range 切换影响）
 	// tokens 列只在真实转发时写入（探测不记 token），所以这里天然不含探测流量
 	const weekStart = new Date(Date.now() - 6 * 86400000).toISOString().slice(0, 10);
 	const dayList = [];
 	for (let i = 6; i >= 0; i--) dayList.push(new Date(Date.now() - i * 86400000).toISOString().slice(0, 10));
-	const trendRows = (await env.DB.prepare(
-		'SELECT substr(day,1,10) AS d, model, SUM(tokens) AS tokens FROM stats WHERE day >= ? GROUP BY d, model ORDER BY d'
+	let trendRows = (await env.DB.prepare(
+		'SELECT provider_id, substr(day,1,10) AS d, model, SUM(tokens) AS tokens FROM stats WHERE day >= ? GROUP BY provider_id, d, model ORDER BY d'
 	).bind(weekStart).all()).results || [];
+	if (!includeInactive) trendRows = trendRows.filter(r => isProviderVisible(r.provider_id) && isModelVisible(r.model));
 	const trendByModel = new Map();
 	for (const r of trendRows) {
 		if (!trendByModel.has(r.model)) trendByModel.set(r.model, {});
@@ -1784,9 +1827,21 @@ async function queryProviderStats(env, range) {
 	}
 
 	// 图表数据②：今日逐模型 token + 请求数（占比环形，请求数含探测 probe_req，与配额面板口径一致）
-	const todayRows = (await env.DB.prepare(
-		'SELECT model, SUM(tokens) AS tokens, SUM(req) AS req, SUM(probe_req) AS probeReq FROM stats WHERE day >= ? GROUP BY model ORDER BY tokens DESC'
+	let todayRows = (await env.DB.prepare(
+		'SELECT provider_id, model, SUM(tokens) AS tokens, SUM(req) AS req, SUM(probe_req) AS probeReq FROM stats WHERE day >= ? GROUP BY provider_id, model ORDER BY tokens DESC'
 	).bind(today).all()).results || [];
+	if (!includeInactive) todayRows = todayRows.filter(r => isProviderVisible(r.provider_id) && isModelVisible(r.model));
+	// 按模型合并回一行：本查询按（渠道, 模型）分组（为按渠道过滤已停用渠道），但「今日模型消耗占比」按模型渲染——
+	// 不合并的话，同名模型会被按渠道拆成多条（.84 回归：环形图出现重复模型名）。无论是否含停用渠道都必须合并。
+	{
+		const byModel = new Map();
+		for (const r of todayRows) {
+			const cur = byModel.get(r.model);
+			if (cur) { cur.tokens += r.tokens || 0; cur.req += r.req || 0; cur.probeReq += r.probeReq || 0; }
+			else byModel.set(r.model, { model: r.model, tokens: r.tokens || 0, req: r.req || 0, probeReq: r.probeReq || 0 });
+		}
+		todayRows = [...byModel.values()].sort((a, b) => (b.tokens - a.tokens) || (b.req - a.req));
+	}
 
 	// 把「渠道 + 模型」的扁平行聚成两层结构
 	const byProvider = new Map();
@@ -1816,6 +1871,7 @@ async function queryProviderStats(env, range) {
 		p.costEst += modelCost;
 		p.models.push({
 			model: r.model,
+			hidden: hiddenModels.has(String(r.model)),
 			// 与 shape 同口径：请求数/成功失败/平均延迟并入探测（.47）
 			req: (r.req || 0) + (r.probeReq || 0),
 			ok: (r.ok || 0) + (r.probeOk || 0),
@@ -1856,12 +1912,22 @@ async function queryProviderStats(env, range) {
 	const providerList = [...byProvider.values()];
 	const totalCostEst = Math.round(providerList.reduce((s, p) => s + (p.costEst || 0), 0) * 100) / 100;
 
+	// summary 由过滤后的 providerList 聚合，与明细口径一致（含已停用开关）
+	const summaryAgg = providerList.reduce((a, p) => {
+		a.req += p.req || 0; a.ok += p.ok || 0; a.fail += p.fail || 0;
+		a.msTotal += p.msTotal || 0; a.probeReq += p.probeReq || 0; a.probeOk += p.probeOk || 0;
+		a.probeFail += p.probeFail || 0; a.probeMsTotal += p.probeMsTotal || 0;
+		a.tokens += p.tokens || 0; a.reasoningTokens += p.reasoningTokens || 0;
+		a.inputTokens += p.inputTokens || 0; a.outputTokens += p.outputTokens || 0;
+		return a;
+	}, { req: 0, ok: 0, fail: 0, msTotal: 0, probeReq: 0, probeOk: 0, probeFail: 0, probeMsTotal: 0, tokens: 0, reasoningTokens: 0, inputTokens: 0, outputTokens: 0 });
+
 	return {
 		enabled: true,
 		range,
 		sinceDay,
 		today,
-		summary: shape(totalsRow, totalCostEst),
+		summary: shape(summaryAgg, totalCostEst),
 		providers: providerList.map(p => ({ id: p.id, name: p.name, ...shape(p, p.costEst), lastMs: p.lastMs || 0, lastAt: p.lastAt || null, models: p.models })),
 		trend: {
 			days: dayList,
@@ -1915,7 +1981,9 @@ const GEMINI_SCHEMA_KEEP = new Set([
 const GEMINI_SCHEMA_RAW_VALUE_KEYS = new Set(['default', 'example', 'enum']);
 
 function cleanGeminiSchema(schema) {
-	if (!schema || typeof schema !== 'object') return { type: 'object', properties: {} };
+	// ★ 数组也必须是「非法输入」：typeof [] === 'object' 会骗过守卫，数组 walk 出来再 JSON 化
+	//   会丢属性 → functionDeclarations[].parameters 变数组 → Gemini 400。
+	if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return { type: 'object', properties: {} };
 	const defs = Object.assign({}, schema.$defs || {}, schema.definitions || {});
 	const walk = (node) => {
 		if (Array.isArray(node)) return node.map(walk);
@@ -2043,7 +2111,9 @@ function buildGeminiRequest(payload) {
 				for (const tc of m.tool_calls) {
 					let args = {};
 					try { args = JSON.parse((tc.function && tc.function.arguments) || '{}'); } catch (_) { args = {}; }
-					if (!args || typeof args !== 'object') args = {};
+					// ★ functionCall.args 与 functionResponse.response 同理：必须是对象(Struct)。
+					//   typeof [] === 'object' 同样能骗过守卫 → 数组 args 透传 → 上游 400。
+					if (!args || typeof args !== 'object' || Array.isArray(args)) args = {};
 					parts.push({
 						functionCall: { name: (tc.function && tc.function.name) || '', args },
 						// ★ 必须带 thoughtSignature（取不到真实签名就用哨兵值，否则 Gemini 3 报 400）
@@ -2054,9 +2124,24 @@ function buildGeminiRequest(payload) {
 			if (parts.length) contents.push({ role: 'model', parts });
 		} else if (role === 'tool' || role === 'function') {
 			const name = nameById[m.tool_call_id] || m.name || '';
+			// 工具结果 → functionResponse.response。★ Gemini 该字段必须是 JSON 对象(Struct)：
+			//   客户端可能回传「JSON 数组字符串」（OpenAI content-parts，如
+			//   '[{"type":"text","text":"x"}]'），JSON.parse 后是数组；typeof [] === 'object'
+			//   骗过了旧守卫 → 数组原样透传 → 上游 400：
+			//   「... function_response: Proto field is not repeating, cannot start list」。
+			//   故：数组一律包成 { result: ... }（数组嵌一层即为合法 Struct Value）。
 			let resp = null;
-			try { resp = JSON.parse(m.content); } catch (_) { resp = null; }
-			if (!resp || typeof resp !== 'object') resp = { result: openaiContentToText(m.content) };
+			if (typeof m.content === 'string') {
+				try { resp = JSON.parse(m.content); } catch (_) { resp = null; }
+			} else if (m.content && typeof m.content === 'object') {
+				resp = m.content;
+			}
+			if (Array.isArray(resp)) {
+				const txt = openaiContentToText(resp);
+				resp = txt ? { result: txt } : { result: resp };
+			} else if (!resp || typeof resp !== 'object') {
+				resp = { result: openaiContentToText(m.content) };
+			}
 			contents.push({ role: 'user', parts: [{ functionResponse: { name, response: resp } }] });
 		}
 	}
@@ -3070,6 +3155,8 @@ function convertOpenAIToAnthropic(openaiResponse, originalModel) {
 			} catch (_) {
 				inputObj = {};
 			}
+			// Anthropic tool_use.input 规范要求对象：数组/标量一律归一化（否则严格 SDK 解析异常）
+			if (!inputObj || typeof inputObj !== 'object' || Array.isArray(inputObj)) inputObj = {};
 			anthropicResponse.content.push({
 				type: 'tool_use',
 				id: tc.id,
@@ -4016,14 +4103,15 @@ async function handleDashboardApi(request, env, ctx) {
 		const okPass = typeof body.password === 'string' && body.password === cred.password;
 		if (okUser && okPass) {
 			clearLoginFailures(ip);
-			// 会话 cookie（不设 Max-Age）→ 关浏览器即登出；1 小时上限由令牌内的 exp 控制
-			const token = makeAdminSessionToken(await adminTokenHash(env));
-			return new Response(JSON.stringify({ success: true }), {
-				headers: {
-					'Content-Type': 'application/json',
-					'Set-Cookie': `admin_token=${token}; Path=/; HttpOnly; SameSite=Strict`
-				}
-			});
+		// 持久 cookie（Max-Age=14400 = 4 小时）→ 关窗口/关浏览器 4 小时内重开仍登录；
+		// 令牌内 exp 同时放宽到 4 小时，与 Max-Age 对齐，杜绝「cookie 在、服务器已拒」
+		const token = makeAdminSessionToken(await adminTokenHash(env));
+		return new Response(JSON.stringify({ success: true }), {
+			headers: {
+				'Content-Type': 'application/json',
+				'Set-Cookie': `admin_token=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=14400`
+			}
+		});
 		}
 		noteLoginFailure(ip);
 		// 用户名/密码错误一律返回同一句话，避免泄露是哪一项错
@@ -4485,7 +4573,9 @@ async function handleDashboardApi(request, env, ctx) {
 		}
 		const raw = url.searchParams.get('range') || 'today';
 		const range = ['today', '7d', 'all'].includes(raw) ? raw : 'today';
-		return new Response(JSON.stringify(await queryProviderStats(env, range)), { headers: { 'Content-Type': 'application/json' } });
+		const incRaw = url.searchParams.get('includeInactive');
+		const includeInactive = incRaw === '1' || incRaw === 'true';
+		return new Response(JSON.stringify(await queryProviderStats(env, range, includeInactive)), { headers: { 'Content-Type': 'application/json' } });
 	}
 
 	// 10. 模型设置和映射
@@ -4538,6 +4628,63 @@ async function handleDashboardApi(request, env, ctx) {
 		}
 	}
 
+	// 11a. 统计看板「隐藏模型」名单（B 方案：显式隐藏，与「含已停用渠道」同一套审计逻辑）
+	if (url.pathname === '/api/hidden-models') {
+		if (!(await verifyAdminCookie(request, env))) {
+			return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+		}
+		if (method === 'POST') {
+			const { model, action } = await request.json();
+			if (!model || (action !== 'add' && action !== 'remove')) {
+				return new Response(JSON.stringify({ error: 'Invalid payload' }), { status: 400 });
+			}
+			const key = String(model).trim();
+			if (!key) return new Response(JSON.stringify({ error: 'Empty model' }), { status: 400 });
+			const config = await getAppConfig(env);
+			const set = new Set(Array.isArray(config.hiddenModels) ? config.hiddenModels.map(String) : []);
+			if (action === 'add') set.add(key);
+			else set.delete(key);
+			config.hiddenModels = [...set];
+			await saveAppConfig(env, config);
+			return new Response(JSON.stringify({ success: true, hiddenModels: config.hiddenModels }), { headers: { 'Content-Type': 'application/json' } });
+		}
+	}
+
+	// 批量隐藏「孤儿模型」：统计里有、但已不在任何渠道 models 列表中的模型。
+	// 只针对默认可见的活跃渠道（status !== 'disabled'）；已隐藏的跳过；数据不删，仅视图层过滤。
+	if (url.pathname === '/api/hidden-models/cleanup') {
+		if (!(await verifyAdminCookie(request, env))) {
+			return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+		}
+		if (method === 'POST') {
+			const config = await getAppConfig(env);
+			const providers = config.providers || [];
+			const hidden = new Set(Array.isArray(config.hiddenModels) ? config.hiddenModels.map(String) : []);
+			const allModels = new Set();
+			providers.forEach(p => (p.models || []).forEach(m => allModels.add(String(m))));
+			// 仅对默认可见的活跃渠道做判定（禁用/删除渠道在默认视图本就不可见，不处理）
+			const visibleProv = new Map(providers.filter(p => p.status !== 'disabled').map(p => [String(p.id), p]));
+			const toHide = [];
+			if (env.DB) {
+				const rows = await env.DB.prepare(`SELECT DISTINCT provider_id, model FROM stats`).all();
+				for (const r of (rows.results || [])) {
+					const prov = visibleProv.get(String(r.provider_id));
+					if (!prov) continue;
+					const m = String(r.model);
+					if (allModels.has(m)) continue; // 仍在某渠道 models 中 → 非孤儿
+					if (hidden.has(m)) continue; // 已隐藏 → 跳过
+					toHide.push(m);
+				}
+			}
+			if (toHide.length) {
+				toHide.forEach(m => hidden.add(m));
+				config.hiddenModels = [...hidden];
+				await saveAppConfig(env, config);
+			}
+			return new Response(JSON.stringify({ success: true, hidden: toHide }), { headers: { 'Content-Type': 'application/json' } });
+		}
+	}
+
 	// 11. 运行模式：是否启用 Cloudflare 账号池 / 默认第三方渠道
 	if (url.pathname === '/api/runtime') {
 		if (method === 'GET') {
@@ -4586,8 +4733,9 @@ async function handleDashboardApi(request, env, ctx) {
 				? models.map(s => String(s).trim()).filter(Boolean)
 				: String(models || '').split(/[\n,]/).map(s => s.trim()).filter(Boolean);
 
-			let providers = await getProviders(env);
-			if (id) {
+		let providers = await getProviders(env);
+		const oldProvider = id ? providers.find(p => p.id === id) : null;
+		if (id) {
 				let found = false;
 				providers = providers.map(p => {
 					if (p.id !== id) return p;
@@ -4631,7 +4779,22 @@ async function handleDashboardApi(request, env, ctx) {
 				}
 			}
 
+			// 编辑渠道的模型列表时双向同步隐藏名单：
+			//  · 从本渠道移除、且已不在任何渠道 models 列表中的模型 → 自动加入隐藏名单
+			//  · 本次重新加回本渠道的模型（之前被自动隐藏过）→ 从隐藏名单移除，恢复可见
+			let hiddenToAdd = [], hiddenToRemove = [];
+			if (oldProvider) {
+				const oldModels = oldProvider.models || [];
+				const allNewModels = new Set();
+				providers.forEach(p => (p.models || []).forEach(m => allNewModels.add(String(m))));
+				hiddenToAdd = oldModels.filter(m => !modelList.includes(m))
+					.filter(m => !allNewModels.has(String(m)));
+				hiddenToRemove = modelList.filter(m => !oldModels.includes(m));
+			}
 			await saveProviders(env, providers);
+			if (hiddenToAdd.length || hiddenToRemove.length) {
+				await applyHiddenModelChanges(env, hiddenToAdd, hiddenToRemove);
+			}
 			return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
 		}
 
@@ -4641,7 +4804,15 @@ async function handleDashboardApi(request, env, ctx) {
 			let providers = config.providers || [];
 			const target = providers.find(p => p.id === id);
 			providers = providers.filter(p => p.id !== id);
+			// 渠道删除后：其独有模型（不在任何剩余渠道 models 列表中）自动加入隐藏名单
+			let hiddenToAdd = [];
+			if (target && target.models && target.models.length) {
+				const remainingModels = new Set();
+				providers.forEach(p => (p.models || []).forEach(m => remainingModels.add(String(m))));
+				hiddenToAdd = target.models.filter(m => !remainingModels.has(String(m)));
+			}
 			await saveProviders(env, providers);
+			if (hiddenToAdd.length) await applyHiddenModelChanges(env, hiddenToAdd, []);
 
 			// 删掉的正是默认渠道时，一并清空默认指向，避免留下一台指向空处的默认路由
 			if (config.defaultProviderId === id) {
@@ -5113,6 +5284,7 @@ async function handleLandingPage(request, env, ctx) {
 	<meta name="robots" content="noindex, nofollow">
 	<meta name="viewport" content="width=device-width, initial-scale=1.0">
 	<title>Workers API Hub</title>
+	${FAVICON_LINK}
 	<link rel="preconnect" href="https://fonts.googleapis.com">
 	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 	<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
@@ -5422,6 +5594,8 @@ async function handleLandingPage(request, env, ctx) {
 			font-size: 36px;
 			font-weight: 700;
 			font-family: 'Outfit', sans-serif;
+			overflow-wrap: anywhere;
+			word-break: break-word;
 		}
 
 		.progress-container {
@@ -6166,6 +6340,7 @@ async function handleAdminPage(request, env, ctx) {
 	<meta name="robots" content="noindex, nofollow">
 	<meta name="viewport" content="width=device-width, initial-scale=1.0">
 	<title>Workers API Hub Dashboard</title>
+	${FAVICON_LINK}
 	<link rel="preconnect" href="https://fonts.googleapis.com">
 	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 	<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -6621,6 +6796,7 @@ async function handleAdminPage(request, env, ctx) {
 			backdrop-filter: blur(var(--glass-blur));
 			-webkit-backdrop-filter: blur(var(--glass-blur));
 			transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.3s, border-color 0.3s;
+			min-width: 0;
 		}
 
 		.stat-card:hover {
@@ -6639,6 +6815,8 @@ async function handleAdminPage(request, env, ctx) {
 			font-size: 32px;
 			font-weight: 700;
 			font-family: 'Outfit', sans-serif;
+			overflow-wrap: anywhere;
+			word-break: break-word;
 		}
 
 		.stat-desc {
@@ -6860,6 +7038,22 @@ async function handleAdminPage(request, env, ctx) {
 		.btn-secondary:hover {
 			background-color: var(--btn-secondary-hover);
 			transform: translateY(-1px);
+		}
+
+		/* 统计栏「显示已隐藏」勾选框：复用 .btn 以获得与其他按钮一致的 hover/active 反馈 */
+		.stats-toggle {
+			font-weight: 600;
+			cursor: pointer;
+			user-select: none;
+		}
+		.stats-toggle.is-checked {
+			border-color: var(--primary-color);
+			color: var(--primary-color);
+		}
+		.stats-toggle input {
+			margin: 0;
+			cursor: pointer;
+			accent-color: var(--primary-color);
 		}
 
 		.btn-success {
@@ -7476,7 +7670,7 @@ async function handleAdminPage(request, env, ctx) {
 
 			<div class="aside-footer">
 				<div style="text-align: center; font-size: 11px; color: var(--text-muted); opacity: 0.55; padding-top: 4px;">
-					<a href="https://github.com/ldg118/workers-api-hub" target="_blank" rel="noopener noreferrer" style="color: inherit; text-decoration: none; border-bottom: 1px solid currentColor;">GitHub</a> · Workers API Hub
+					<a href="https://github.com/ldg118/workers-api-hub" target="_blank" rel="noopener noreferrer" style="color: inherit; text-decoration: none; border-bottom: 1px solid currentColor;">GitHub</a> · Workers API Hub · <span title="${BUILD_ID}" style="cursor: default;">${BUILD_ID.split('.').pop()}</span>
 				</div>
 			</div>
 		</aside>
@@ -7520,6 +7714,10 @@ async function handleAdminPage(request, env, ctx) {
 								<button class="btn btn-secondary" id="stats-range-7d" onclick="setStatsRange('7d')" style="padding: 6px 12px; font-size: 12px;">近 7 天</button>
 								<button class="btn btn-secondary" id="stats-range-all" onclick="setStatsRange('all')" style="padding: 6px 12px; font-size: 12px;">全部</button>
 								<button class="btn btn-secondary" id="stats-refresh" onclick="refreshProviderStats()" title="重新从 D1 读取统计" style="padding: 6px 12px; font-size: 12px;">↻ 刷新</button>
+							<label class="btn btn-secondary stats-toggle" id="stats-include-inactive-wrap" style="font-size: 12px; padding: 6px 12px; gap: 5px; white-space: nowrap;">
+								<input type="checkbox" id="stats-include-inactive" onchange="this.closest('label').classList.toggle('is-checked', this.checked); refreshProviderStats()"> 显示已隐藏
+							</label>
+							<button class="btn btn-secondary" id="stats-cleanup-orphans" onclick="cleanupOrphanModels()" title="把统计里有、但已不在任何渠道模型列表中的失效模型一次性隐藏" style="padding: 6px 12px; font-size: 12px;">隐藏失效模型</button>
 							</div>
 						</div>
 						<div class="section-note">仅统计「经过本代理」的第三方渠道请求；与上游账单口径不同，仅供参考。</div>
@@ -8504,7 +8702,6 @@ async function handleAdminPage(request, env, ctx) {
 
 			// 如果不是手动刷新，且最后更新时间在 15 分钟以内，则直接使用缓存，不发起 API 请求
 			if (!isManual && lastFetched && (now - lastFetched) < 15 * 60 * 1000) {
-				console.log('Skipping auto refresh, last fetch was ' + Math.round((now - lastFetched) / 1000) + 's ago');
 				return;
 			}
 
@@ -8639,6 +8836,29 @@ async function handleAdminPage(request, env, ctx) {
 			if (el) el.innerText = text;
 		}
 
+		// 累计 Token 数自适应缩写（M/B/T/P/E）：自动选最合适单位，短数字（<1e6，即 ≤6 位）显示完整逗号格式，
+		// 更长或累计到极大时自动缩写——开源后调用量大、累计值可能极巨，故单位多备两档（P=1e15 / E=1e18）。
+		// 精确值仍可经 title 悬停查看。
+		// 累计 Token 数万进制自然读数：7 位以内（<1e7，卡片可单行容纳）显示完整逗号格式，
+		// 8 位起缩写（百万/千万/亿/十亿/…/百亿亿），系数恒 1.00~9.99，不撑破卡片。精确值仍可 title 悬停。
+		function fmtTokenCompact(n) {
+			n = Number(n) || 0;
+			if (n < 1e7) return n.toLocaleString();
+			const units = [
+				['百亿亿', 1e18], ['十亿亿', 1e17], ['亿亿', 1e16],
+				['千万亿', 1e15], ['百万亿', 1e14], ['十万亿', 1e13],
+				['万亿', 1e12], ['千亿', 1e11], ['百亿', 1e10], ['十亿', 1e9],
+				['亿', 1e8], ['千万', 1e7], ['百万', 1e6],
+			];
+			for (const [sym, div] of units) {
+				if (n >= div) {
+					const str = String(Number((n / div).toFixed(2)));
+					return str + sym;
+				}
+			}
+			return n.toLocaleString();
+		}
+
 		// 「最近一次延迟」的小字时间（本月-日 时:分，本地时区）
 		function fmtStatsLastAt(iso) {
 			const d = new Date(iso);
@@ -8660,6 +8880,39 @@ async function handleAdminPage(request, env, ctx) {
 				if (tr.dataset.parent !== pid) return;
 				tr.style.display = tr.style.display === 'none' ? '' : 'none';
 			});
+		}
+
+		// 看板模型行「隐藏 / 恢复」（B 方案：显式隐藏名单落 config.hiddenModels）
+		async function toggleHideModel(btn) {
+			const pid = btn.dataset.pid, model = btn.dataset.model, action = btn.dataset.action;
+			if (!model) return;
+			try {
+				const res = await apiFetch('/api/hidden-models', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ model, action })
+				});
+				const data = await res.json();
+				if (!data.success) throw new Error(data.error || '操作失败');
+				showToast(action === 'add' ? ('已隐藏模型：' + model) : ('已恢复模型：' + model));
+				refreshProviderStats();
+			} catch (e) {
+				showToast('操作失败：' + e.message, 'error');
+			}
+		}
+
+		// 批量隐藏孤儿模型：统计里有、但已不在任何渠道 models 列表中的失效模型
+		async function cleanupOrphanModels() {
+			try {
+				const res = await apiFetch('/api/hidden-models/cleanup', { method: 'POST' });
+				const data = await res.json();
+				if (!data.success) throw new Error(data.error || '操作失败');
+				const n = (data.hidden || []).length;
+				showToast(n ? ('已隐藏 ' + n + ' 个孤儿模型') : '没有需要隐藏的孤儿模型');
+				refreshProviderStats();
+			} catch (e) {
+				showToast('操作失败：' + e.message, 'error');
+			}
 		}
 
 		let providerTrendChart = null;
@@ -8771,7 +9024,9 @@ async function handleAdminPage(request, env, ctx) {
 			const disabledEl = document.getElementById('provider-stats-disabled');
 			const bodyEl = document.getElementById('provider-stats-body');
 			try {
-				const res = await apiFetch('/api/provider-stats?range=' + encodeURIComponent(statsRange));
+				const incEl = document.getElementById('stats-include-inactive');
+			const inc = (incEl && incEl.checked) ? '1' : '0';
+			const res = await apiFetch('/api/provider-stats?range=' + encodeURIComponent(statsRange) + '&includeInactive=' + inc);
 				const data = await res.json();
 
 				// 未绑定 D1：只提示，不报错、不影响代理
@@ -8788,8 +9043,10 @@ async function handleAdminPage(request, env, ctx) {
 			setTextById('stats-okrate', s.req ? s.okRate + '%' : '—');
 			setTextById('stats-okfail', rangeText + ' · 成功 ' + (s.ok || 0) + ' / 失败 ' + (s.fail || 0));
 			setTextById('stats-avgms', s.req ? (s.avgMs ? s.avgMs + ' ms' : '超时') : '—');
-			setTextById('stats-tokens', (s.tokens || 0).toLocaleString());
-			setTextById('stats-reasoning', '含思考 ' + (s.reasoningTokens || 0).toLocaleString());
+		setTextById('stats-tokens', fmtTokenCompact(s.tokens || 0));
+		const tokEl = document.getElementById('stats-tokens');
+		if (tokEl) tokEl.title = (s.tokens || 0).toLocaleString() + ' tokens（累计，悬停查看精确值）';
+		setTextById('stats-reasoning', '含思考 ' + fmtTokenCompact(s.reasoningTokens || 0));
 			setTextById('stats-cost', '$' + (s.costEst != null ? s.costEst.toFixed(2) : '0.00'));
 
 			renderProviderTrendChart(data.trend);
@@ -8813,16 +9070,20 @@ async function handleAdminPage(request, env, ctx) {
 					+ '<td>' + (p.reasoningTokens || 0).toLocaleString() + '</td>'
 					+ '<td>$' + (p.costEst != null ? p.costEst.toFixed(2) : '0.00') + '</td>'
 					+ '</tr>';
-				const models = (p.models || []).map(m => '<tr class="stats-model-row" data-parent="' + sen(p.id) + '" style="display:none;">'
-					+ '<td style="padding-left:36px; font-size:12.5px; color: var(--text-muted);">' + sen(m.model || '(未记录)') + '</td>'
+			const models = (p.models || []).map(m => {
+				const isHidden = !!m.hidden;
+				const btn = '<button data-pid="' + sen(p.id) + '" data-model="' + sen(m.model || '') + '" data-action="' + (isHidden ? 'remove' : 'add') + '" onclick="toggleHideModel(this)" style="font-size:10px; padding:1px 6px; margin-left:6px; border:1px solid var(--border-color); background:transparent; color:' + (isHidden ? 'var(--warning-color)' : 'var(--text-muted)') + '; border-radius:6px; cursor:pointer;">' + (isHidden ? '恢复' : '隐藏') + '</button>';
+				return '<tr class="stats-model-row" data-parent="' + sen(p.id) + '" style="display:none;">'
+					+ '<td style="padding-left:36px; font-size:12.5px; color: var(--text-muted);">' + sen(m.model || '(未记录)') + (isHidden ? ' <span style="color:var(--warning-color);font-size:11px;">[已隐藏]</span>' : '') + '</td>'
 					+ '<td style="font-size:12.5px;">' + (m.req || 0) + '</td>'
 					+ '<td style="font-size:12.5px;">' + (m.ok || 0) + ' / ' + (m.fail || 0) + '</td>'
 					+ '<td style="font-size:12.5px;">' + (m.req ? Math.round(m.ok / m.req * 1000) / 10 + '%' : '—') + '</td>'
 					+ '<td style="font-size:12.5px;">' + statsLatencyCell(m.avgMs, m.req, m.lastMs, m.lastAt) + '</td>'
 					+ '<td style="font-size:12.5px;">' + (m.tokens || 0).toLocaleString() + '</td>'
 					+ '<td style="font-size:12.5px;">' + (m.reasoningTokens || 0).toLocaleString() + '</td>'
-					+ '<td style="font-size:12.5px;">$' + (m.costEst != null ? m.costEst.toFixed(2) : '0.00') + '</td>'
-					+ '</tr>').join('');
+					+ '<td style="font-size:12.5px;">$' + (m.costEst != null ? m.costEst.toFixed(2) : '0.00') + btn + '</td>'
+					+ '</tr>';
+			}).join('');
 				return head + models;
 			}).join('');
 			} catch (e) {
@@ -10946,6 +11207,7 @@ function handleKVError(request) {
 	<meta charset="UTF-8">
 	<meta name="viewport" content="width=device-width, initial-scale=1.0">
 	<title>KV 绑定异常 - Workers API Hub</title>
+	${FAVICON_LINK}
 	<link rel="preconnect" href="https://fonts.googleapis.com">
 	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 	<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
@@ -11127,6 +11389,7 @@ function handlePasswordError(request) {
 	<meta charset="UTF-8">
 	<meta name="viewport" content="width=device-width, initial-scale=1.0">
 	<title>管理员密码未配置 - Workers API Hub</title>
+	${FAVICON_LINK}
 	<link rel="preconnect" href="https://fonts.googleapis.com">
 	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 	<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
