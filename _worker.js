@@ -10,7 +10,7 @@
 // ★★ 硬约定：**每次改动 _worker.js 都要把版本号 +1**（日期变了就换新日期，**序号继续递增、不重置**）。
 //    格式固定 `YYYY-MM-DD.N`。验证脚本会拦下格式不对的值，但「有没有 +1」只能靠自觉 ——
 //    曾经因为版本号没变，本地/线上分不清哪个是哪版，白排查了一整轮。
-const BUILD_ID = '2026-10-09.118';
+const BUILD_ID = '2026-10-09.136';
 
 // 系统默认密钥自动轮换参数
 const ROTATE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000; // 轮换周期：7 天
@@ -74,6 +74,33 @@ async function fetchWithTtfb(url, init = {}) {
 // 期间一个字节都不发的话 Cloudflare 边缘会判「响应不完整」并回 502。
 // 定期发一个 SSE 注释帧（以 ":" 开头，SSE 规范规定客户端应忽略）即可保活，对输出无影响。
 const SSE_HEARTBEAT_MS = 15000;
+
+// Anthropic thinking 块的占位 signature（2026-10-09，NVIDIA NIM 适配）。
+// 真实的 thinking signature 是 Anthropic 服务端签的加密串，用于服务端校验「思考块回传」；
+// 本代理的思考内容来自上游的 reasoning_content（OpenAI 侧字段，无签名概念），且请求方向
+// 转换时客户端回传的 thinking 块会被直接丢弃 —— 签名永远不会被任何一方校验，占位即可。
+// 客户端（如 Claude Code）只把它当不透明字符串携带，不做本地校验。
+const THINKING_SIG_PLACEHOLDER = 'gateway-thinking-placeholder';
+
+// 上下文溢出钳制重试的安全余量（token 数，2026-10-09，NVIDIA NIM 适配）。
+// 钳制后的 max_tokens = 上限 - 消息 - 余量。余量不必大：两次请求的消息完全相同、
+// 上游 tokenizer 计数一致，纯粹防边界抖动。
+const CONTEXT_RETRY_MARGIN = 512;
+
+// 从上游 400 错误文本里抠出「上下文上限 + 消息 token 数」（OpenAI / NIM 系措辞）：
+// "This model's maximum context length is 131072 tokens. However, you requested
+//  135072 tokens (125000 in the messages, 10072 in the completion)."
+// 解析不出（别家的 400）就返回 null —— 绝不在没把握时瞎改参数重试。
+function parseContextOverflow(errText) {
+	const text = String(errText || '');
+	const mMax = text.match(/maximum context length is (\d+)/i);
+	const mBreak = text.match(/\((\d+) in the messages?, (\d+) in the completion\)/i);
+	if (!mMax || !mBreak) return null;
+	const max = Number(mMax[1]);
+	const prompt = Number(mBreak[1]);
+	if (!Number.isFinite(max) || !Number.isFinite(prompt) || max <= 0 || prompt < 0) return null;
+	return { max, prompt };
+}
 
 // Gemini 原生适配层总开关（2026-10-05）：true = googleapis 系渠道走原生 generateContent（含工具调用）；
 // false = 全部回落旧的 OpenAI 兼容端点 + 工具历史折文本（一行降级，见「Gemini 原生适配层」）。
@@ -195,7 +222,12 @@ const DEFAULT_CONFIG = {
 	systemKeyRotationEnabled: false,
 	systemKeyRotatedAt: null,
 	systemApiKeyPrev: null,
-	hiddenModels: []
+	hiddenModels: [],
+	// 逐条模型映射的独立开关：这里存的是「已停用」的映射源名（不删映射本身，随时可再打开）
+	disabledMappings: [],
+	// 「不要注入 stream_options」的 (渠道|上游模型) 名单：某些端点会因不认识该字段而整条 4xx。
+	// 首次被拒后自动记入，之后对该模型不再注入（参考 nim-proxy 的做法）。
+	noUsageInject: []
 };
 
 async function getAppConfig(env) {
@@ -219,6 +251,10 @@ async function getAppConfig(env) {
 				providers: Array.isArray(data.providers) ? data.providers : [],
 				// 隐藏模型名单：用户在看板逐行「隐藏」后落入此处（B 方案）
 				hiddenModels: Array.isArray(data.hiddenModels) ? data.hiddenModels : [],
+				// 已停用的模型映射源名（逐条开关）；老配置缺省 = 全部启用（零迁移）
+				disabledMappings: Array.isArray(data.disabledMappings) ? data.disabledMappings : [],
+				// 不注入 stream_options 的 (渠道|模型) 名单；老配置缺省 = 空（全部照常注入）
+				noUsageInject: Array.isArray(data.noUsageInject) ? data.noUsageInject : [],
 				// 未显式设置过时：有 CF 账号就沿用「开启」（不静默改变现有部署的行为），
 				// 一个账号都没有则视为纯第三方模式，默认关闭账号池
 				cfPoolEnabled: typeof data.cfPoolEnabled === 'boolean' ? data.cfPoolEnabled : accounts.length > 0,
@@ -320,6 +356,31 @@ async function getCustomModelMap(env) {
 async function saveCustomModelMap(env, map) {
 	const config = await getAppConfig(env);
 	config.customModelMap = map;
+	await saveAppConfig(env, config);
+}
+
+// ---- 「不再注入 stream_options」的本地记忆 ----
+// 某些 OpenAI 兼容端点不认识 stream_options，会直接 4xx 拒掉整条请求 → 该模型的流式从此永远失败。
+// 对策（参考 nim-proxy）：撞到这种拒绝时去掉注入重试一次，并把该 (渠道|上游模型) 记入名单，之后不再注入。
+// 注意：只在**错误正文点名了 stream_options/include_usage** 时才重试 —— 不盲目重试，
+// 因为对 40 RPM 这类免费档来说，多打一次上游就是少一次真额度。
+function usageInjectKeyOf(providerId, model) {
+	return String(providerId) + '|' + String(model || '');
+}
+
+function isUsageInjectDisabled(config, providerId, model) {
+	const list = (config && Array.isArray(config.noUsageInject)) ? config.noUsageInject : [];
+	return list.indexOf(usageInjectKeyOf(providerId, model)) !== -1;
+}
+
+async function markUsageInjectDisabled(env, providerId, model) {
+	if (!env || !providerId) return;
+	const config = await getAppConfig(env);
+	const set = new Set((Array.isArray(config.noUsageInject) ? config.noUsageInject : []).map(String));
+	const key = usageInjectKeyOf(providerId, model);
+	if (set.has(key)) return;   // 已在名单里：不再产生 KV 写
+	set.add(key);
+	config.noUsageInject = [...set];
 	await saveAppConfig(env, config);
 }
 
@@ -578,8 +639,30 @@ async function queryQuotaUsage(env, group, members) {
 //       ② 上游报错（429/5xx/超时）把成员**临时踢出**（冷却）；
 //       ③ 一次请求内自动换成员重试（有上限、带排除名单）。
 
-const QUOTA_COOLDOWN_429_MS = 60000; // 429 限流：冷却 60s（上游给了 retry_after 就取更长的）
+const QUOTA_COOLDOWN_429_MS = 60000; // 429 限流：默认冷却 60s（上游给了 retry_after 就取更长的）。
+// 429 冷却时长可用 env.COOLDOWN_429_MS 覆盖（2026-10-09，NVIDIA NIM 适配）：
+// 免费档限流多为 RPM 级（如 NVIDIA 40 RPM），撞限流后 1~2s 就能继续，
+// 固定 60s 对这类上游偏保守 —— 设 2000~5000 更贴合。仅影响「写冷却」时长，
+// retry_after 语义不变（仍取两者较长）。
+function cooldown429Ms(env) {
+	const v = Number(env && env.COOLDOWN_429_MS);
+	return Number.isFinite(v) && v >= 1000 ? v : QUOTA_COOLDOWN_429_MS;
+}
 const QUOTA_COOLDOWN_ERR_MS = 30000; // 5xx / 超时 / 连不上：冷却 30s
+// 上游「模型级并发已满」（NIM：`ResourceExhausted: Worker local total request limit reached (32/32)`）。
+// 与 429 限流、与「额度耗尽」都不同：它是**瞬时拥塞**（几十秒内随生成结束自愈），
+// 而且该上限**按模型、跨 key 共享**（换渠道也未必躲得开，只有换到别家基础设施才可能有用）。
+// ⚠️ 必须排在「额度耗尽」判定**之前**：否则正文里的 ResourceExhausted 会命中那条
+//   `/resource_exhausted/i`，被误判成额度耗尽 → 白关 30 分钟。
+// 可用 env.COOLDOWN_WORKER_EXHAUST_MS 覆盖（默认 20s：够让一批生成跑完，又不至于长期闲着）。
+const QUOTA_COOLDOWN_WORKER_MS = 20000;
+function cooldownWorkerExhaustMs(env) {
+	const v = Number(env && env.COOLDOWN_WORKER_EXHAUST_MS);
+	return Number.isFinite(v) && v >= 1000 ? v : QUOTA_COOLDOWN_WORKER_MS;
+}
+// 判定上游是否在说「我不认识 stream_options / include_usage」。
+// 只有正文点名了这个字段才做「去掉注入重试一次」，避免对普通 400 盲目重试（白白多打一次上游额度）。
+const USAGE_FIELD_REJECTED_RE = /stream_options|include_usage/i;
 // 「额度耗尽」类错误（402 余额不足 / 429+insufficient_quota / RESOURCE_EXHAUSTED）：
 // 这类失败**不会**在几十秒后自愈 —— 要等配额周期重置（一天/一月）。若仍按 60s 冷却，
 // 调度器会反复回头撞同一堵墙：每次都白失败一次、冷却期内还用不了它。
@@ -588,6 +671,12 @@ const QUOTA_COOLDOWN_ERR_MS = 30000; // 5xx / 超时 / 连不上：冷却 30s
 const QUOTA_COOLDOWN_QUOTA_MS = 30 * 60 * 1000; // 额度/余额耗尽：冷却 30 分钟
 const QUOTA_COOLDOWN_MAX_MS = 1800000; // 冷却上限 30 分钟（防被上游的超长 retry_after 卡死）
 const QUOTA_MAX_SWITCH = 3; // 一次请求内最多尝试几个成员（含第一个）
+// 可用 env.QUOTA_MAX_SWITCH 覆盖（2~10）。注意代价：每多试一个成员 = 多一次上游往返，
+// 若失败是「超时」型，最坏情况会成倍拉长这个请求的等待时间 —— 所以默认保守取 3。
+function quotaMaxSwitch(env) {
+	const v = Number(env && env.QUOTA_MAX_SWITCH);
+	return Number.isFinite(v) && v >= 2 ? Math.min(10, Math.floor(v)) : QUOTA_MAX_SWITCH;
+}
 // 瞬时基础设施错误（5xx / 超时 / 连不上）的「原地重试」次数。
 // 现实依据（2026-10-06 直连 Google 实测）：gemini-3.1-flash-lite 会间歇性返回
 // 503「This model is currently experiencing high demand. Spikes in demand are usually temporary.」
@@ -736,9 +825,22 @@ async function clearCooldown(env, providerId, model) {
 // transient = 瞬时基础设施错误（5xx / 超时 / 连不上）→ 值得**原地再试一次**；
 //             429 / 401 / 403 / 402 不算（原地重试没用，得换成员或等冷却）。
 // 冷却时长分两档：瞬时错误 30s / 429 限流 60s；**额度耗尽类 30 分钟**（不会自愈，见常量注释）。
-function classifyUpstreamFailure(result) {
+function classifyUpstreamFailure(result, env) {
 	const s = Number((result && (result.upstreamStatus || result.status)) || 0);
 	const msg = String((result && result.error) || '');
+	// ★ 最先判「模型级 worker 池挤满」（2026-10-09，参考 nim-proxy）：
+	//   NIM 除 40 RPM 外还有**每模型 worker 并发上限**，报错正文含 `ResourceExhausted:
+	//   Worker local total request limit reached (32/32)`。若落到下面的 `/resource_exhausted/i`
+	//   会被误判成「额度/余额已耗尽」→ 白关 30 分钟；而它其实是**几十秒自愈的瞬时拥塞**。
+	//   给短冷却；**不设 transient** —— 循环里的原地重试只睡 0.5s，对拥塞没意义，只白烧一次上游额度。
+	if (/worker local total request limit|worker[^.]*request limit reached/i.test(msg)) {
+		return {
+			retryable: true,
+			transient: false,
+			coolMs: cooldownWorkerExhaustMs(env),
+			reason: '上游模型级并发已满（worker 池挤满，稍后自愈）'
+		};
+	}
 	let out;
 	// ★ 额度/余额耗尽优先判定：这类失败**必须换成员**，且要**长冷却**。
 	//   · 402 Payment Required —— OpenRouter 等「余额不足」走这个码；
@@ -749,7 +851,7 @@ function classifyUpstreamFailure(result) {
 	if (s === 402 || (s === 429 && quotaExhausted)) {
 		out = { retryable: true, transient: false, coolMs: QUOTA_COOLDOWN_QUOTA_MS, reason: `上游 ${s}（额度/余额已耗尽）` };
 	}
-	else if (s === 429) out = { retryable: true, transient: false, coolMs: QUOTA_COOLDOWN_429_MS, reason: '上游 429 限流' };
+	else if (s === 429) out = { retryable: true, transient: false, coolMs: cooldown429Ms(env), reason: '上游 429 限流' };
 	else if (s === 401 || s === 403) out = { retryable: true, transient: false, coolMs: QUOTA_COOLDOWN_ERR_MS, reason: `上游 ${s}（key 无效 / 无权限）` };
 	else if (s >= 500) out = { retryable: true, transient: true, coolMs: QUOTA_COOLDOWN_ERR_MS, reason: `上游 ${s}` };
 	else if (s >= 400) out = { retryable: false, transient: false, coolMs: 0, reason: `上游 ${s}（请求本身有问题，换成员也没用）` };
@@ -895,9 +997,7 @@ async function pickQuotaMember(group, env, opts) {
 	// 计量单位：'token' = 按 token 总量，其它（缺省）= 按请求条数。
 	// 旧配置不带这个字段 → 一律当 'count'，语义与改造前完全一致（零迁移）。
 	const unitOf = (m) => (m.unit === 'token' ? 'token' : 'count');
-	// 打分的分母：有限成员用自己的 limit；「不限」成员（limit<=0）用组内最大 limit 做分母，
-	// 好让不限成员彼此仍可比。全组都不限时无分母 → 退化为绝对量比较（= 改造前行为）。
-	const maxLimit = usable.reduce((mx, m) => Math.max(mx, Number(m.limit) || 0), 0);
+	// 打分的分母在下面「定层」之后再算（只按本层算）——层内成员共用同一个分母，层间没有可比性。
 
 	const rows = [];
 	for (const m of usable) {
@@ -929,18 +1029,38 @@ async function pickQuotaMember(group, env, opts) {
 		};
 	}
 
-	// 调度总开关关闭 → 回到旧行为：按组内顺序取第一个未满（rows 保持组内顺序，未排序）
+	// ---- 组内优先级（2026-10-09）----
+	// 语义：数字越小越优先（default 1）。**只在「当前可用的最高那一层」里选人，层内依旧是原来的负载均衡**
+	// —— 两者正交、互补，不是二选一。高层成员被冷却 / 停用 / 已满时它就不在 rows 里了，
+	// 这一层自然塌到下一层，这就是「优先用 A，A 挂了才用 B」的兜底。
+	const prioOf = (m) => {
+		const n = Math.floor(Number(m && m.priority));
+		return Number.isFinite(n) && n > 0 ? n : 1;
+	};
+
+	// 调度总开关关闭 → 不做负载均衡 / 不换成员 / 不冷却；但**优先级仍生效**
+	// （按「优先级 → 配置顺序」取第一个未满）。全部同优先级时 = 原样按配置顺序 = 与改造前完全一致
+	//（rows 保持组内顺序，而 sort 是稳定的）。
 	if (!sched) {
-		const first = rows[0];
+		const first = rows.slice().sort((a, b) => prioOf(a.m) - prioOf(b.m))[0];
 		return { ok: true, providerId: first.m.providerId, model: first.m.model, used: first.used, limit: first.limit };
 	}
+
+	// 定层：只保留可用的最高优先级那一层作为候选（全部没填 priority 时 tierPrio=1、tierRows===rows）
+	const tierPrio = rows.reduce((mn, r) => Math.min(mn, prioOf(r.m)), Infinity);
+	const tierRows = rows.filter(r => prioOf(r.m) === tierPrio);
+	const tierKeys = new Set(tierRows.map(r => r.m._key));
+	const tierUsable = usable.filter(m => tierKeys.has(m._key));
+	// 打分的分母：有限成员用自己的 limit；「不限」成员（limit<=0）用**本层**最大 limit 做分母，
+	// 好让不限成员彼此仍可比。全层都不限时为 0 → 小数点退化为绝对量比较（= 改造前行为）。
+	const maxLimit = tierUsable.reduce((mx, m) => Math.max(mx, Number(m.limit) || 0), 0);
 
 	// 会话粘性：同一会话尽量落到同一个成员 —— 多轮对话 / 工具调用更稳（保住上游 Prompt 缓存）。
 	// 用「组内配置顺序 + 会话散列」确定性计算，不需要存状态；该成员不可用时自动回落均衡。
 	// ★ 默认开启（opt-out）：只有显式设为 false 才关闭；未设置一律视为开。
 	if (opts.sessionKey && group.sticky !== false) {
-		const want = usable[hashString(opts.sessionKey) % usable.length];
-		const hit = rows.find(r => r.m._key === want._key);
+		const want = tierUsable[hashString(opts.sessionKey) % tierUsable.length];
+		const hit = tierRows.find(r => r.m._key === want._key);
 		if (hit) return { ok: true, providerId: hit.m.providerId, model: hit.m.model, used: hit.used, limit: hit.limit, sticky: true };
 	}
 
@@ -956,8 +1076,8 @@ async function pickQuotaMember(group, env, opts) {
 			: (maxLimit > 0 ? r.hour / maxLimit : r.hour);
 		return hourRatio * QUOTA_HOUR_WEIGHT + usedRatio + r.busy * QUOTA_BUSY_WEIGHT;
 	};
-	rows.sort((a, b) => scoreOf(a) - scoreOf(b) || a.rnd - b.rnd);
-	const pick = rows[0];
+	tierRows.sort((a, b) => scoreOf(a) - scoreOf(b) || a.rnd - b.rnd);
+	const pick = tierRows[0];
 	return { ok: true, providerId: pick.m.providerId, model: pick.m.model, used: pick.used, limit: pick.limit };
 }
 
@@ -1372,6 +1492,11 @@ async function handleV1Proxy(request, env, ctx) {
 				}
 			}
 		}
+		// 逐条映射开关：被停用的映射不列出来（列了却调不通 = 误导客户端）
+		{
+			const off = new Set(Array.isArray(config.disabledMappings) ? config.disabledMappings.map(String) : []);
+			if (off.size) for (const k of Object.keys(combinedMap)) if (off.has(k)) delete combinedMap[k];
+		}
 		const providers = (config.providers || []).filter(p => p.status !== 'disabled');
 
 		// owned_by 标明真实来源：客户端拉模型列表时能一眼看出这个模型走哪条上游。
@@ -1762,6 +1887,18 @@ function withUsageTap(stream, onUsage) {
 	let maxReasoning = 0;
 	let maxInput = 0;
 	let maxOutput = 0;
+	// ★ 一次性闸门（2026-10-09）：落库回调只许跑一次。
+	//   客户端中途断开时，cancel() 与背景循环收尾的 finally 都会跑到 —— 实测各调一次
+	//   （见 _verify_stats.mjs「中断流只记一次」），于是请求数 +2、token 翻倍。
+	//   两者都改走 fire()，谁先到谁生效，后到的被忽略。
+	let fired = false;
+	const fire = () => {
+		if (fired) return;
+		fired = true;
+		try {
+			onUsage({ tokens: maxTotal, reasoningTokens: maxReasoning, inputTokens: maxInput, outputTokens: maxOutput });
+		} catch (e) { /* 统计失败绝不影响请求 */ }
+	};
 	return new ReadableStream({
 		// 铁律：Worker 上必须 start 主动排空，绝不用裸 pull（见 MEMORY.md 流式约定）
 		start(controller) {
@@ -1796,14 +1933,15 @@ function withUsageTap(stream, onUsage) {
 				} catch (e) {
 					try { controller.error(e); } catch (_) { }
 				} finally {
-					try { onUsage({ tokens: maxTotal, reasoningTokens: maxReasoning, inputTokens: maxInput, outputTokens: maxOutput }); } catch (e) { /* 统计失败绝不影响请求 */ }
+					fire();
 				}
 			})();
 		},
 		cancel(reason) {
 			try { reader.cancel(reason); } catch (e) { }
-			// 回调必须与 start 尾部的形状一致（对象），否则调用方读 uo.tokens 恒为 undefined → 中断的流 token 记 0
-			try { onUsage({ tokens: maxTotal, reasoningTokens: maxReasoning, inputTokens: maxInput, outputTokens: maxOutput }); } catch (e) { }
+			// 回调必须与 start 收尾一致（同一个对象形状、同一个 fire 闸门），
+			// 否则调用方读 uo.tokens 恒为 undefined → 中断的流 token 记 0
+			fire();
 		},
 	});
 }
@@ -2193,6 +2331,15 @@ function extractThoughtSignature(tc) {
 //   用官方哨兵值跳过校验。sub2api 实证 + 2026-10-06 直连 Google 实测：哨兵值 → 200 正常回答。
 const GEMINI_DUMMY_THOUGHT_SIGNATURE = 'skip_thought_signature_validator';
 
+// reasoning_effort → Gemini 思考档位（2026-10-09，修「客户端关思考对 Gemini 无效」）。
+// 手册口径（ai.google.dev/gemini-api/docs/generate-content/thinking，2026-10-09 查证）：
+//   · Gemini 3 系用 thinkingLevel（minimal/low/medium/high）——**不能完全关闭**：
+//     3.1 Pro 关不了，3 Flash / Flash-Lite 也只到 minimal（最接近零的档）。
+//   · Gemini 2.5 系用 thinkingBudget（0=关；Pro 关不了、最小 128；-1=动态）。
+// none/off 是「客户端想关」的语义：3 系压到 minimal，2.5 flash 给 0、2.5 Pro 给最小 128。
+const GEMINI_EFFORT_TO_LEVEL = { none: 'minimal', off: 'minimal', minimal: 'minimal', low: 'low', medium: 'medium', high: 'high' };
+const GEMINI_EFFORT_TO_BUDGET_25 = { none: 0, off: 0, minimal: 1024, low: 2048, medium: 8192, high: 16384 };
+
 // OpenAI Chat Completions 请求 → Gemini generateContent 请求体
 function buildGeminiRequest(payload) {
 	const messages = Array.isArray(payload.messages) ? payload.messages : [];
@@ -2284,6 +2431,21 @@ function buildGeminiRequest(payload) {
 		: (typeof payload.max_completion_tokens === 'number' ? payload.max_completion_tokens : null);
 	if (maxTokens != null) gc.maxOutputTokens = maxTokens;
 	if (Array.isArray(payload.stop) && payload.stop.length) gc.stopSequences = payload.stop.slice(0, 5);
+	// reasoning_effort → 思考档位（映射依据见 GEMINI_EFFORT_TO_LEVEL 注释）。
+	// 只认已知档位名，未知值忽略（不加 thinkingConfig，模型走自己的默认档）。
+	// includeThoughts:true 让思考摘要随 parts（thought:true）回吐 —— 下方转发链要用。
+	const effort = typeof payload.reasoning_effort === 'string' ? payload.reasoning_effort.trim().toLowerCase() : '';
+	if (effort && GEMINI_EFFORT_TO_LEVEL[effort] != null) {
+		const m = String(payload.model || '');
+		if (/^gemini-2/i.test(m)) {
+			let budget = GEMINI_EFFORT_TO_BUDGET_25[effort];
+			// 2.5 Pro 不支持关闭：none/off 的 0 档抬到最小 128（手册：128~32768，不能 disable）
+			if (/pro/i.test(m) && budget < 128) budget = 128;
+			gc.thinkingConfig = { thinkingBudget: budget, includeThoughts: true };
+		} else {
+			gc.thinkingConfig = { thinkingLevel: GEMINI_EFFORT_TO_LEVEL[effort], includeThoughts: true };
+		}
+	}
 	if (Object.keys(gc).length) out.generationConfig = gc;
 	return out;
 }
@@ -2293,10 +2455,15 @@ function geminiResponseToOpenAI(gj, modelName) {
 	const cand = (gj && Array.isArray(gj.candidates) && gj.candidates[0]) || {};
 	const parts = (cand.content && Array.isArray(cand.content.parts)) ? cand.content.parts : [];
 	let text = '';
+	let reasoning = '';
 	const toolCalls = [];
 	for (const p of parts) {
-		// 跳过内部思考 part（Gemini 3 会以 thought:true 回吐），别混进正文
-		if (p && p.thought === true) continue;
+		// 思考摘要 part（thought:true）→ reasoning_content（2026-10-09 起不再丢弃）：
+		// OpenAI 客户端直接可见；Anthropic 路径经 reasoning_content→thinking 管道自动成思考块。
+		if (p && p.thought === true) {
+			if (typeof p.text === 'string' && p.text) reasoning += p.text;
+			continue;
+		}
 		if (p && typeof p.text === 'string' && p.text) text += p.text;
 		if (p && p.functionCall) {
 			const tc = {
@@ -2313,6 +2480,7 @@ function geminiResponseToOpenAI(gj, modelName) {
 		}
 	}
 	const message = { role: 'assistant', content: text || null };
+	if (reasoning) message.reasoning_content = reasoning;
 	if (toolCalls.length) message.tool_calls = toolCalls;
 	let finish = 'stop';
 	if (toolCalls.length) finish = 'tool_calls';
@@ -2376,9 +2544,17 @@ function geminiStreamToOpenAI(body, modelName) {
 							try { gj = JSON.parse(payloadStr); } catch (_) { continue; }
 							const cand = (gj && Array.isArray(gj.candidates) && gj.candidates[0]) || {};
 							const parts = (cand.content && Array.isArray(cand.content.parts)) ? cand.content.parts : [];
-							for (const p of parts) {
-								if (p && p.thought === true) continue; // 内部思考不下发
-								if (p && typeof p.text === 'string' && p.text) {
+						for (const p of parts) {
+							// 思考摘要 part（thought:true）→ reasoning_content delta（2026-10-09 起不再丢弃）。
+							// 正文 content 仍绝不混思考；Anthropic 路径经管道自动转成 thinking 块。
+							if (p && p.thought === true) {
+								if (typeof p.text === 'string' && p.text) {
+									if (!roleSent) { roleSent = true; emit(mkChunk({ role: 'assistant', content: '' }, null)); }
+									emit(mkChunk({ reasoning_content: p.text }, null));
+								}
+								continue;
+							}
+							if (p && typeof p.text === 'string' && p.text) {
 									if (!roleSent) { roleSent = true; emit(mkChunk({ role: 'assistant', content: '' }, null)); }
 									emit(mkChunk({ content: p.text }, null));
 								}
@@ -2462,7 +2638,7 @@ async function callGeminiNative(provider, payload, stream) {
 	}
 }
 
-async function callProvider(provider, payload, stream) {
+async function callProvider(provider, payload, stream, env) {
 	// Gemini 渠道走原生适配层（见上方「Gemini 原生适配层」）
 	if (isGeminiProvider(provider)) return callGeminiNative(provider, payload, stream);
 
@@ -2483,32 +2659,74 @@ async function callProvider(provider, payload, stream) {
 		// OpenAI 系默认不在流里回 usage，导致 Anthropic 客户端侧 message_delta.usage 恒为 0、
 		// 本代理的流式 token 统计也拿不到。显式请求 include_usage，上游在最后一条 chunk 带 usage，
 		// 由 withUsageTap 捕获补记统计、anthropicStreamTransform 转成 Anthropic 的 usage 事件。
+		// ⚠️ 但有些端点根本不认这个字段、会整条 4xx 拒掉 → 那个模型的流式从此永远失败。
+		// 故先查「不再注入」名单：被拒过的 (渠道|模型) 直接不注入（见 markUsageInjectDisabled）。
 		// 统一延迟口径：拿到响应头即测 TTFB（首字节），流式/非流式都记这个值
-		const sendPayload = stream
+		const cfg = env ? await getAppConfig(env) : null;
+		const injectUsage = !!stream && !isUsageInjectDisabled(cfg, provider.id, payload && payload.model);
+		const sendPayload = injectUsage
 			? { ...payload, stream_options: { include_usage: true } }
 			: payload;
-		const { response: upstream, ttfb } = await fetchWithTtfb(`${baseUrl}/chat/completions`, {
-			method: 'POST',
-			headers,
-			body: JSON.stringify(sendPayload),
-		});
 
-		if (!upstream.ok) {
-			const errorText = await upstream.text();
-			// upstreamStatus 供「失败分类」用（429/5xx 可换成员重试，400 不可）；
-			// status 是给客户端的：4xx 原样透出（CF 只替换 5xx 响应体），其余压成 502。
-			return {
-				success: false,
-				upstreamStatus: upstream.status,
-				status: (upstream.status >= 400 && upstream.status < 500) ? upstream.status : 502,
-				error: `Provider "${provider.name}" returned ${upstream.status}: ${errorText}`
-			};
+		// 单次上游调用（错误归一也在这里）。抽成闭包是因为「上下文溢出」时可能要钳 max_tokens 再打一次。
+		const attempt = async (p) => {
+			const { response: upstream, ttfb } = await fetchWithTtfb(`${baseUrl}/chat/completions`, {
+				method: 'POST',
+				headers,
+				body: JSON.stringify(p),
+			});
+
+			if (!upstream.ok) {
+				const errorText = await upstream.text();
+				// upstreamStatus 供「失败分类」用（429/5xx 可换成员重试，400 不可）；
+				// status 是给客户端的：4xx 原样透出（CF 只替换 5xx 响应体），其余压成 502。
+				return {
+					success: false,
+					upstreamStatus: upstream.status,
+					status: (upstream.status >= 400 && upstream.status < 500) ? upstream.status : 502,
+					error: `Provider "${provider.name}" returned ${upstream.status}: ${errorText}`,
+					errorText,
+				};
+			}
+
+			if (stream) {
+				return { success: true, stream: upstream.body, ttfb };
+			}
+			return { success: true, data: await upstream.json(), ttfb };
+		};
+
+		let result = await attempt(sendPayload);
+
+		// ① stream_options 被上游拒掉 → 去掉注入重试一次，并把该 (渠道|模型) 记入「不再注入」名单。
+		//    不然这个模型的**每一次**流式请求都要白撞一次 4xx（参考 nim-proxy 的做法）。
+		//    只在错误正文点名了 stream_options/include_usage 时触发，不盲目重试普通 400。
+		if (injectUsage && !result.success
+			&& result.upstreamStatus >= 400 && result.upstreamStatus < 500
+			&& USAGE_FIELD_REJECTED_RE.test(result.errorText || '')) {
+			const retry = await attempt(payload);
+			if (retry.success) {
+				await markUsageInjectDisabled(env, provider.id, payload && payload.model);
+				console.warn('[usage-inject] 上游拒绝 stream_options，已对 ' + usageInjectKeyOf(provider.id, payload && payload.model) + ' 关闭注入');
+			}
+			result = retry;
 		}
 
-		if (stream) {
-			return { success: true, stream: upstream.body, ttfb };
+		// ② 上下文溢出钳制重试（2026-10-09，NVIDIA NIM 适配）：上游按精确 tokenizer 计数，
+		// 长会话 + 大 max_tokens 预算会撞 400「maximum context length」。若**消息本身放得下**、
+		// 只是输出预算太奢侈，把 max_tokens 钳到（上限 - 消息 - 余量）重打一次，对客户端透明；
+		// 消息本身就超限则无解（只能靠客户端精简会话），维持原样透出。只重试一次。
+		if (!result.success && result.upstreamStatus === 400) {
+			const clamp = parseContextOverflow(result.errorText || '');
+			if (clamp) {
+				const newMax = clamp.max - clamp.prompt - CONTEXT_RETRY_MARGIN;
+				// 原预算已经比钳制值小却还 400 → 问题不在 max_tokens，瞎重试没意义
+				if (newMax >= 64 && (payload.max_tokens == null || payload.max_tokens > newMax)) {
+					result = await attempt({ ...sendPayload, max_tokens: newMax });
+				}
+			}
 		}
-		return { success: true, data: await upstream.json(), ttfb };
+
+		return result;
 	} catch (e) {
 		const isTimeout = !!(e && e.isTimeout);
 		return {
@@ -2621,7 +2839,7 @@ async function callUpstream(route, payload, env, stream, ctx) {
 	// 总开关关掉时：不换成员、不冷却、也不重试（回到最早的行为）。
 	const sched = await isQuotaSchedulingOn(env);
 	const tried = new Set();
-	const switchBudget = (route.quotaGroupId && sched) ? QUOTA_MAX_SWITCH : 1;
+	const switchBudget = (route.quotaGroupId && sched) ? quotaMaxSwitch(env) : 1;
 	const sessionKey = route.quotaGroupId ? sessionKeyOf(payload) : '';
 	let transientBudget = sched ? PROVIDER_TRANSIENT_RETRY : 0;
 	let switchedAny = false;
@@ -2665,7 +2883,7 @@ async function callUpstream(route, payload, env, stream, ctx) {
 		const startedAt = Date.now();
 		let r;
 		try {
-			r = await callProvider(curProvider, preparePayload(curProvider, curModel), stream);
+			r = await callProvider(curProvider, preparePayload(curProvider, curModel), stream, env);
 		} finally {
 			// 用 finally 保证 inc/dec 配平：入参表达式若同步抛错，旧写法会跳过 dec → 在途计数永久 +1
 			inflightDec(memberKey);
@@ -2696,7 +2914,7 @@ async function callUpstream(route, payload, env, stream, ctx) {
 
 		// 失败：先落统计，再判断该不该冷却 / 换下一个 / 原地重试
 		recordProviderCall(env, ctx, curProvider, curModel, false, elapsed, false, 0);
-		lastCls = classifyUpstreamFailure(r);
+		lastCls = classifyUpstreamFailure(r, env);
 		if (lastCls.retryable && sched) await setCooldown(env, curProvider.id, curModel, lastCls.coolMs, lastCls.reason);
 		result = r;
 		if (!lastCls.retryable) break; // 400 这类是请求本身的问题，换成员 / 重试都一样
@@ -2833,10 +3051,22 @@ async function resolveRoute(model, env, sessionKey) {
 		cfEnabled ? DEFAULT_MODEL_MAP : null,
 		config.customModelMap || {});
 	let mapped = combinedMap[requested];
+	let mappedKey = mapped ? requested : null;
 
 	// 兼容老写法：内置表已统一叫 cf/<短名>，客户端填的裸短名（glm-4.7-flash）继续认
 	if (!mapped && !requested.includes('/')) {
-		mapped = combinedMap['cf/' + requested];
+		const aliasKey = 'cf/' + requested;
+		const aliasVal = combinedMap[aliasKey];
+		if (aliasVal) { mapped = aliasVal; mappedKey = aliasKey; }
+	}
+
+	// 逐条映射开关（2026-10-09）：这条映射被停用 → 显式 400。
+	// 刻意**不**静默回落到默认渠道 —— 那会「答非所问」，是最难排查的一类问题。
+	if (mapped && mappedKey && (config.disabledMappings || []).indexOf(mappedKey) !== -1) {
+		return {
+			kind: 'error',
+			error: `Model "${requested}" 的映射已被停用（到「模型映射」里重新开启，或换用其它模型名）。`
+		};
 	}
 
 	// 映射写了但解析不出渠道时记下来，别让它静默失效
@@ -3051,6 +3281,19 @@ function convertAnthropicToOpenAI(anthropicBody) {
 		openaiBody.stop = anthropicBody.stop_sequences;
 	}
 
+	// Anthropic thinking → reasoning_effort（2026-10-09）：Claude Code 等客户端的思考开关
+	// 以前在这里被静默丢弃 —— 现在能传到下游：Gemini 原生路径映射成 thinkingLevel/thinkingBudget，
+	// 第三方渠道按白名单透传。预算折档：≤2048 low、≤8192 medium、其余 high；disabled → none。
+	const th = anthropicBody.thinking;
+	if (th && typeof th === 'object') {
+		if (th.type === 'disabled') {
+			openaiBody.reasoning_effort = 'none';
+		} else if (th.type === 'enabled' && Number(th.budget_tokens) > 0) {
+			const b = Number(th.budget_tokens);
+			openaiBody.reasoning_effort = b <= 2048 ? 'low' : (b <= 8192 ? 'medium' : 'high');
+		}
+	}
+
 	// 构建 OpenAI 格式的 messages 数组
 	const openaiMessages = [];
 
@@ -3246,6 +3489,17 @@ function convertOpenAIToAnthropic(openaiResponse, originalModel) {
 		}
 	};
 
+	// reasoning_content → thinking 块（NVIDIA NIM / DeepSeek 系思考模型）。
+	// signature 用占位值：本代理在请求方向会丢弃客户端回传的 thinking 块（转换器只认
+	// text/tool_use/tool_result/image），签名永远不会被校验，占位即可满足协议形状。
+	if (message.reasoning_content) {
+		anthropicResponse.content.push({
+			type: 'thinking',
+			thinking: String(message.reasoning_content),
+			signature: THINKING_SIG_PLACEHOLDER
+		});
+	}
+
 	// 文本内容 → text block
 	if (message.content) {
 		anthropicResponse.content.push({
@@ -3418,6 +3672,7 @@ function anthropicStreamTransform(upstreamBody, modelName) {
 	let currentToolArgs = '';
 	let streamStarted = false;
 	let blockStopSent = false;  // 跟踪最后一个 content block 是否已发送 stop（Bug #2）
+	let thinkingOpen = false;   // thinking 块是否开着（2026-10-09 reasoning_content 适配）
 	let inputTokens = 0;
 	let outputTokens = 0;
 	let finalFinish = '';       // 上游最后一个 finish_reason（把 length 映射成 max_tokens，与非流式口径一致）
@@ -3427,6 +3682,13 @@ function anthropicStreamTransform(upstreamBody, modelName) {
 		// ⚠️ 主动排空（eager drain），理由同 passthroughStream：
 		// Workers 上 pull 驱动可能永远等不到下游需求 → 流不产出 → 被判 hang → 502。
 		start(controller) {
+			// 急切 message_start（2026-10-09，NVIDIA NIM 适配）：大模型首 token 可达 3~8s
+			// 甚至更久（Nemotron Ultra 253B 的 TTFT 是设计如此）。先把 message_start 发出去，
+			// 客户端（Claude Code 等）立刻有消息对象可渲染，而不是干等上游首字节。
+			// 此刻 usage 必然为 0 —— 真实值由收尾的 message_delta 补，口径与原先一致。
+			// 注意：发完要同步置 streamStarted，否则首个内容 delta 会重复发一次 message_start。
+			sendMessageStart(controller);
+			streamStarted = true;
 			(async () => {
 				try {
 					while (true) {
@@ -3496,65 +3758,93 @@ function anthropicStreamTransform(upstreamBody, modelName) {
 
 					const delta = choice.delta || {};
 
-					// 处理 tool_calls delta
-					if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
-						// 首次发送任何数据前先发送 message_start（Bug #1）
-						if (!streamStarted) {
-							sendMessageStart(controller);
-							streamStarted = true;
-						}
-
-						for (const tc of delta.tool_calls) {
-							if (tc.id) {
-								// 新的 tool_call 开始。**任何**已打开但未关闭的内容块都要先收掉 ——
-								// 不能只判断「上一个工具块」：若此刻开着的是文本块（index 0），直接就
-								// contentBlockIndex++ 到 1 并 content_block_start，会发出非法的 SSE 序列
-								// （index 0 永远没有 content_block_stop）。反向 tool→text 已有对称处理。
-								if (!blockStopSent && contentBlockIndex >= 0) {
-									sendContentBlockStop(controller);
-									blockStopSent = true;
+				// 处理 tool_calls delta
+				if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
+					for (const tc of delta.tool_calls) {
+						if (tc.id) {
+							// 新的 tool_call 开始。**任何**已打开但未关闭的内容块都要先收掉 ——
+							// 不能只判断「上一个工具块」：若此刻开着的是文本块（index 0），直接就
+							// contentBlockIndex++ 到 1 并 content_block_start，会发出非法的 SSE 序列
+							// （index 0 永远没有 content_block_stop）。反向 tool→text 已有对称处理。
+							// 若开着的是 thinking 块，收尾前要先补 signature_delta（协议形状）。
+							if (!blockStopSent && contentBlockIndex >= 0) {
+								if (thinkingOpen) {
+									sendThinkingSignature(controller);
+									thinkingOpen = false;
 								}
-								currentToolCallId = tc.id;
-								currentToolName = tc.function?.name || '';
-								currentToolArgs = '';
-								contentBlockIndex++;
-								blockStopSent = false;
-
-								sendContentBlockStart(controller, 'tool_use');
+								sendContentBlockStop(controller);
+								blockStopSent = true;
 							}
-
-							if (tc.function?.arguments) {
-								currentToolArgs += tc.function.arguments;
-								// 发送 tool_use 的 input_json_delta
-								sendToolUseDelta(controller, tc.function.arguments);
-							}
-						}
-					} else if (delta.content) {
-						// 文本内容 delta
-						if (!streamStarted) {
-							sendMessageStart(controller);
+							currentToolCallId = tc.id;
+							currentToolName = tc.function?.name || '';
+							currentToolArgs = '';
 							contentBlockIndex++;
-							sendContentBlockStart(controller, 'text');
-							streamStarted = true;
 							blockStopSent = false;
+
+							sendContentBlockStart(controller, 'tool_use');
 						}
 
-						// 如果之前有 tool_call 在进行中，先结束
-						if (currentToolCallId) {
+						if (tc.function?.arguments) {
+							currentToolArgs += tc.function.arguments;
+							// 发送 tool_use 的 input_json_delta
+							sendToolUseDelta(controller, tc.function.arguments);
+						}
+					}
+				} else if (delta.reasoning_content || delta.reasoning) {
+					// 思考增量（NVIDIA NIM / DeepSeek 系：reasoning_content）→ thinking 块。
+					// message_start 已急切发过，这里只管开块 / 续流。
+					if (!thinkingOpen) {
+						// 从其他块切进 thinking：先收掉当前块（罕见，但保持对称），并清掉工具
+						// 状态 —— 否则后续文本 delta 会走 tool→text 分支，对已收掉的块重复发 stop。
+						if (contentBlockIndex >= 0 && !blockStopSent) {
 							sendContentBlockStop(controller);
 							blockStopSent = true;
+						}
+						if (currentToolCallId) {
 							currentToolCallId = null;
 							currentToolName = null;
 							currentToolArgs = '';
-
-							// 开始新的 text block
-							contentBlockIndex++;
-							sendContentBlockStart(controller, 'text');
-							blockStopSent = false;
 						}
-
-						sendTextDelta(controller, delta.content);
+						contentBlockIndex++;
+						blockStopSent = false;
+						sendContentBlockStart(controller, 'thinking');
+						thinkingOpen = true;
 					}
+					sendThinkingDelta(controller, String(delta.reasoning_content || delta.reasoning));
+				} else if (delta.content) {
+					// 文本内容 delta（message_start 已急切发过：首个内容只负责开块）
+					if (thinkingOpen) {
+						// thinking → text：先补 signature_delta 再收块，然后开新的 text 块
+						sendThinkingSignature(controller);
+						sendContentBlockStop(controller);
+						blockStopSent = true;
+						thinkingOpen = false;
+						contentBlockIndex++;
+						sendContentBlockStart(controller, 'text');
+						blockStopSent = false;
+					} else if (contentBlockIndex < 0) {
+						// 首个内容块（原先靠 streamStarted 兜着，急切发送后改看块下标）
+						contentBlockIndex++;
+						sendContentBlockStart(controller, 'text');
+						blockStopSent = false;
+					}
+
+					// 如果之前有 tool_call 在进行中，先结束
+					if (currentToolCallId) {
+						sendContentBlockStop(controller);
+						blockStopSent = true;
+						currentToolCallId = null;
+						currentToolName = null;
+						currentToolArgs = '';
+
+						// 开始新的 text block
+						contentBlockIndex++;
+						sendContentBlockStart(controller, 'text');
+						blockStopSent = false;
+					}
+
+					sendTextDelta(controller, delta.content);
+				}
 
 					// 检查 finish_reason
 					if (choice.finish_reason) {
@@ -3595,7 +3885,9 @@ function anthropicStreamTransform(upstreamBody, modelName) {
 			index: contentBlockIndex,
 			content_block: blockType === 'tool_use'
 				? { type: 'tool_use', id: currentToolCallId, name: currentToolName, input: {} }
-				: { type: 'text', text: '' }
+				: blockType === 'thinking'
+					? { type: 'thinking', thinking: '' }
+					: { type: 'text', text: '' }
 		};
 		controller.enqueue(encoder.encode(`event: content_block_start\ndata: ${JSON.stringify(event)}\n\n`));
 	}
@@ -3605,6 +3897,25 @@ function anthropicStreamTransform(upstreamBody, modelName) {
 			type: 'content_block_delta',
 			index: contentBlockIndex,
 			delta: { type: 'text_delta', text }
+		};
+		controller.enqueue(encoder.encode(`event: content_block_delta\ndata: ${JSON.stringify(event)}\n\n`));
+	}
+
+	function sendThinkingDelta(controller, text) {
+		const event = {
+			type: 'content_block_delta',
+			index: contentBlockIndex,
+			delta: { type: 'thinking_delta', thinking: text }
+		};
+		controller.enqueue(encoder.encode(`event: content_block_delta\ndata: ${JSON.stringify(event)}\n\n`));
+	}
+
+	// thinking 块收尾前必须补 signature_delta（协议形状；占位值，见 THINKING_SIG_PLACEHOLDER 注释）
+	function sendThinkingSignature(controller) {
+		const event = {
+			type: 'content_block_delta',
+			index: contentBlockIndex,
+			delta: { type: 'signature_delta', signature: THINKING_SIG_PLACEHOLDER }
 		};
 		controller.enqueue(encoder.encode(`event: content_block_delta\ndata: ${JSON.stringify(event)}\n\n`));
 	}
@@ -3647,6 +3958,11 @@ function anthropicStreamTransform(upstreamBody, modelName) {
 
 		// 有内容块且尚未收尾 → 补 content_block_stop；无内容块时 contentBlockIndex 为 -1，不能发（index:-1 非法）
 		if (!blockStopSent && contentBlockIndex >= 0) {
+			// thinking 块还开着（上游只出了思考、没有正文/工具）→ 先补 signature 再收
+			if (thinkingOpen) {
+				sendThinkingSignature(controller);
+				thinkingOpen = false;
+			}
 			sendContentBlockStop(controller);
 			blockStopSent = true;
 		}
@@ -4699,7 +5015,9 @@ async function handleDashboardApi(request, env, ctx) {
 			return new Response(JSON.stringify({
 				customModelMap: customMap,
 				invalid,
-				cfPoolEnabled: cfEnabled
+				cfPoolEnabled: cfEnabled,
+				// 逐条映射开关（已停用的源名），界面据此渲染每行的小开关
+				disabledMappings: Array.isArray(config.disabledMappings) ? config.disabledMappings : []
 			}), { headers: { 'Content-Type': 'application/json' } });
 		}
 
@@ -4730,12 +5048,43 @@ async function handleDashboardApi(request, env, ctx) {
 
 			await saveCustomModelMap(env, normalized);
 
+			// 顺带清掉「已停用」名单里已不存在的源名（删映射 / 改名后别留孤儿开关状态）。
+			// 注意：**不动**仍然存在的映射的开关状态 —— 用户停用的那些保存后应保持停用。
+			{
+				const cfg2 = await getAppConfig(env);
+				const prev = Array.isArray(cfg2.disabledMappings) ? cfg2.disabledMappings : [];
+				const pruned = prev.filter(s => Object.prototype.hasOwnProperty.call(normalized, s));
+				if (pruned.length !== prev.length) {
+					cfg2.disabledMappings = pruned;
+					await saveAppConfig(env, cfg2);
+				}
+			}
+
 			// 保存本身照常成功（避免用户卡在一条错映射上连删都删不掉），
 			// 但把问题显式回传，界面会立刻提示
 			const problems = findInvalidMappings(normalized, providers, cfEnabled);
 			const warnings = Object.entries(problems).map(([s, p]) => '「' + s + '」：' + p);
 			return new Response(JSON.stringify({ success: true, autoFixed, warnings, invalid: problems }), { headers: { 'Content-Type': 'application/json' } });
 		}
+	}
+
+	// 10a. 单条模型映射的启用 / 停用（映射表每行的小开关）。
+	//      只改 config.disabledMappings —— 不删映射本身；停用后 resolveRoute 命中该源名会显式 400，
+	//      且 /v1/models 不再列出（避免「列出来却调不通」）。
+	if (url.pathname === '/api/mappings/status' && method === 'POST') {
+		const body = await request.json().catch(() => ({}));
+		const source = String(body.source || '').trim();
+		if (!source) {
+			return new Response(JSON.stringify({ error: 'source is required' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+		}
+		const enabled = body.enabled !== false;
+		const config = await getAppConfig(env);
+		const set = new Set(Array.isArray(config.disabledMappings) ? config.disabledMappings.map(String) : []);
+		if (enabled) set.delete(source); else set.add(source);
+		config.disabledMappings = [...set];
+		await saveAppConfig(env, config);
+		return new Response(JSON.stringify({ success: true, disabledMappings: config.disabledMappings }),
+			{ headers: { 'Content-Type': 'application/json' } });
 	}
 
 	// 11a. 统计看板「隐藏模型」名单（B 方案：显式隐藏，与「含已停用渠道」同一套审计逻辑）
@@ -4964,6 +5313,22 @@ async function handleDashboardApi(request, env, ctx) {
 		}
 	}
 
+	// 12a. 渠道「启用 / 停用」轻量切换（列表卡片上的外置开关用）。
+	//      只改 status 一个字段，不碰 name/baseUrl/models/geminiNative —— 避免整条渠道回写时丢字段。
+	if (url.pathname === '/api/providers/status' && method === 'POST') {
+		const body = await request.json().catch(() => ({}));
+		const id = String(body.id || '');
+		const status = body.status === 'disabled' ? 'disabled' : 'active';
+		let providers = await getProviders(env);
+		const idx = providers.findIndex(p => p.id === id);
+		if (idx === -1) {
+			return new Response(JSON.stringify({ error: 'Provider not found' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
+		}
+		providers[idx] = { ...providers[idx], status };
+		await saveProviders(env, providers);
+		return new Response(JSON.stringify({ success: true, status }), { headers: { 'Content-Type': 'application/json' } });
+	}
+
 	// 12. 配额组：一组候选模型 + 各自的配额上限（按次数或 token），按负载自动分摊、报错自动换成员
 	if (url.pathname === '/api/quota-groups') {
 		if (method === 'GET') {
@@ -5059,12 +5424,25 @@ async function handleDashboardApi(request, env, ctx) {
 					}
 					limit = Math.floor(n);
 				}
+				// 组内优先级：>=1 的整数，数字越小越先用；留空/缺省 = 1（与旧配置行为一致）。
+				// 与「上限」同样处理：填了非法值就**显式报错**，不静默兜底成 1（否则用户以为改生效了）。
+				let priority = 1;
+				const rawPrio = m.priority;
+				if (rawPrio !== undefined && rawPrio !== null && rawPrio !== '') {
+					const pn = Number(rawPrio);
+					if (!Number.isFinite(pn) || pn < 1) {
+						return new Response(JSON.stringify({
+							error: `成员「${model}」的优先级不是合法数字：${JSON.stringify(rawPrio)}（留空或 1 表示最高优先级，数字越大越靠后）`
+						}), { status: 400, headers: { 'Content-Type': 'application/json' } });
+					}
+					priority = Math.floor(pn);
+				}
 				const memberKey = providerId + '\u0000' + model;
 				if (seenMemberKeys.has(memberKey)) continue;   // 同渠道同模型只保留第一条
 				seenMemberKeys.add(memberKey);
 				// 计量单位只认白名单 'token'，其余（含缺省）一律 'count' —— 兼容旧配置语义
 				const unit = m.unit === 'token' ? 'token' : 'count';
-				members.push({ providerId, model, limit, unit, status: m.status === 'disabled' ? 'disabled' : 'active' });
+				members.push({ providerId, model, limit, unit, priority, status: m.status === 'disabled' ? 'disabled' : 'active' });
 			}
 
 			if (!members.length) {
@@ -5118,6 +5496,22 @@ async function handleDashboardApi(request, env, ctx) {
 			await saveQuotaGroups(env, groups);
 			return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
 		}
+	}
+
+	// 12c. 配额组「启用 / 停用」轻量切换（组卡片头部的外置开关用）。
+	//      只改该组的 status；停用后 TT:<组名> 与指向它的映射都会显式报「组未启用」，不再参与选号。
+	if (url.pathname === '/api/quota-groups/status' && method === 'POST') {
+		const body = await request.json().catch(() => ({}));
+		const id = String(body.id || '');
+		const status = body.status === 'disabled' ? 'disabled' : 'active';
+		let groups = await getQuotaGroups(env);
+		const idx = groups.findIndex(g => g.id === id);
+		if (idx === -1) {
+			return new Response(JSON.stringify({ error: '配额组不存在' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
+		}
+		groups[idx] = { ...groups[idx], status };
+		await saveQuotaGroups(env, groups);
+		return new Response(JSON.stringify({ success: true, status }), { headers: { 'Content-Type': 'application/json' } });
 	}
 
 	// 12b. 配额调度总开关（负载均衡 / 成员冷却 / 换成员重试）+ 手动解除冷却
@@ -7449,20 +7843,178 @@ async function handleAdminPage(request, env, ctx) {
 		.quota-group-card.open .quota-group-body {
 			display: block;
 		}
-		/* 渠道模型列：默认只露前几个，多了折起来 */
-		.prov-models-toggle {
-			display: block;
-			background: none;
-			border: none;
-			padding: 2px 0;
-			margin-top: 4px;
-			color: var(--accent-color);
-			cursor: pointer;
-			font-size: 11.5px;
-			font-family: inherit;
+		/* ---- 紧凑列表卡片（渠道 / 账号 / 密钥 共用；方案B：一行摘要 + 点开展开）---- */
+		.list-stack {
+			display: flex;
+			flex-direction: column;
+			gap: 10px;
+			margin-top: 16px;
 		}
-		.prov-models-toggle:hover {
+		.list-card {
+			border: 1px solid var(--border-color);
+			border-radius: 12px;
+			background: var(--section-item-bg);
+			overflow: hidden;
+		}
+		.list-head {
+			display: flex;
+			align-items: center;
+			gap: 10px;
+			flex-wrap: wrap;
+			padding: 12px 16px;
+			cursor: pointer;
+			user-select: none;
+		}
+		.list-head:hover {
+			background: var(--table-header-bg);
+		}
+		.list-arrow {
+			width: 12px;
+			font-size: 10px;
+			color: var(--text-muted);
+			flex: none;
+		}
+		.list-title {
+			font-weight: 600;
+			font-size: 14px;
+			color: var(--text-main);
+		}
+		.list-meta {
+			font-size: 12px;
+			color: var(--text-muted);
+		}
+		.list-spacer {
+			margin-left: auto;
+		}
+		.list-body {
+			display: none;
+			padding: 4px 16px 14px 38px;
+			border-top: 1px solid var(--border-color);
+		}
+		.list-card.open .list-body {
+			display: block;
+		}
+		.list-row {
+			display: flex;
+			gap: 10px;
+			align-items: flex-start;
+			padding: 7px 0;
+		}
+		.list-label {
+			flex: none;
+			width: 72px;
+			font-size: 12px;
+			color: var(--text-muted);
+			padding-top: 1px;
+		}
+		.list-url {
+			font-family: monospace;
+			font-size: 12px;
+			color: var(--code-color);
+			overflow: hidden;
+			text-overflow: ellipsis;
+			white-space: nowrap;
+			cursor: pointer;
+			min-width: 0;
+		}
+		.list-url:hover {
 			text-decoration: underline;
+		}
+		.chips {
+			display: flex;
+			flex-wrap: wrap;
+			gap: 6px;
+			min-width: 0;
+		}
+		.chip {
+			font-size: 11.5px;
+			font-family: monospace;
+			line-height: 1.5;
+			padding: 2px 8px;
+			border-radius: 999px;
+			background: var(--table-header-bg);
+			color: var(--text-main);
+			border: 1px solid var(--border-color);
+			max-width: 100%;
+			overflow: hidden;
+			text-overflow: ellipsis;
+			white-space: nowrap;
+		}
+		.chip-more {
+			cursor: pointer;
+			color: var(--accent-color);
+		}
+		.list-actions {
+			display: flex;
+			gap: 8px;
+			flex-wrap: wrap;
+			padding-top: 8px;
+			/* 操作按钮统一靠右 —— 更符合「内容在左、操作在右」的习惯（2026-10-09 用户要求） */
+			justify-content: flex-end;
+		}
+		/* 密钥展示框：比普通行内 code 长，看着像个字段而不是一个碎片；点击即复制 */
+		.key-cell {
+			display: inline-block;
+			min-width: 220px;
+			max-width: 100%;
+			padding: 5px 12px;
+			border: 1px solid var(--border-color);
+			border-radius: 8px;
+			background: var(--table-header-bg);
+			font-size: 12.5px;
+			cursor: pointer;
+			overflow: hidden;
+			text-overflow: ellipsis;
+			white-space: nowrap;
+		}
+		.key-cell:hover {
+			border-color: var(--accent-color);
+		}
+		/* 外置启用/停用开关（渠道卡片头 / 配额组卡片头共用） */
+		.switch {
+			position: relative;
+			display: inline-flex;
+			align-items: center;
+			width: 40px;
+			height: 22px;
+			flex: none;
+			cursor: pointer;
+		}
+		.switch input {
+			position: absolute;
+			opacity: 0;
+			width: 0;
+			height: 0;
+			margin: 0;
+		}
+		.switch .switch-track {
+			position: absolute;
+			inset: 0;
+			border-radius: 999px;
+			background: var(--input-border);
+			transition: background .2s;
+		}
+		.switch .switch-track::after {
+			content: '';
+			position: absolute;
+			top: 3px;
+			left: 3px;
+			width: 16px;
+			height: 16px;
+			border-radius: 50%;
+			background: #fff;
+			transition: transform .2s;
+			box-shadow: 0 1px 2px rgba(0, 0, 0, .3);
+		}
+		.switch input:checked + .switch-track {
+			background: var(--success-color);
+		}
+		.switch input:checked + .switch-track::after {
+			transform: translateX(18px);
+		}
+		.switch input:focus-visible + .switch-track {
+			outline: 2px solid var(--accent-color);
+			outline-offset: 2px;
 		}
 		.hint-grid {
 			display: grid;
@@ -7865,10 +8417,6 @@ async function handleAdminPage(request, env, ctx) {
 					<svg style="width: 18px; height: 18px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path></svg>
 					数据看板
 				</div>
-				<div class="nav-item cf-only" id="menu-accounts" onclick="switchTab('accounts')">
-					<svg style="width: 18px; height: 18px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
-					账号管理
-				</div>
 
 				<div class="nav-group-title">代理接入</div>
 				<div class="nav-item${defaultTab === 'access' ? ' active' : ''}" id="menu-access" onclick="switchTab('access')">
@@ -7891,6 +8439,10 @@ async function handleAdminPage(request, env, ctx) {
 				</div>
 
 				<div class="nav-group-title">设置</div>
+				<div class="nav-item cf-only" id="menu-accounts" onclick="switchTab('accounts')">
+					<svg style="width: 18px; height: 18px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
+					账号管理
+				</div>
 				<div class="nav-item" id="menu-theme" onclick="toggleTheme()">
 					<svg class="theme-icon-sun" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none; width: 18px; height: 18px;">
 						<circle cx="12" cy="12" r="4" />
@@ -8115,19 +8667,9 @@ async function handleAdminPage(request, env, ctx) {
 							</button>
 						</div>
 
-						<table>
-							<thead>
-								<tr>
-									<th>别名</th>
-									<th>Account ID</th>
-									<th>API Token</th>
-									<th>操作</th>
-								</tr>
-							</thead>
-							<tbody id="accounts-table-body">
-								<!-- Accounts rows -->
-							</tbody>
-						</table>
+						<div class="list-stack" id="accounts-list">
+							<!-- Account cards -->
+						</div>
 					</div>
 				</div>
 
@@ -8198,20 +8740,9 @@ async function handleAdminPage(request, env, ctx) {
 							<span id="rotation-next" style="color:var(--text-muted);"></span>
 						</div>
 
-						<table>
-							<thead>
-								<tr>
-									<th>密钥描述</th>
-									<th>API Key</th>
-									<th>创建时间</th>
-									<th>有效期 / 轮换</th>
-									<th>操作</th>
-								</tr>
-							</thead>
-							<tbody id="keys-table-body">
-								<!-- Keys rows -->
-							</tbody>
-						</table>
+						<div class="list-stack" id="keys-list">
+							<!-- Keys cards -->
+						</div>
 					</div>
 
 					<div class="hint-card collapsed" id="access-test-hint" style="margin-top: 24px;">
@@ -8273,7 +8804,7 @@ async function handleAdminPage(request, env, ctx) {
 									<th>客户端请求模型</th>
 									<th>映射后的目标模型</th>
 									<th>类型</th>
-									<th style="width: 100px;">操作</th>
+									<th style="width: 160px;">启用 / 操作</th>
 								</tr>
 							</thead>
 							<tbody id="mappings-table-body">
@@ -8354,20 +8885,9 @@ async function handleAdminPage(request, env, ctx) {
 							</div>
 						</div>
 
-						<table style="margin-top: 20px;">
-							<thead>
-								<tr>
-									<th>渠道名</th>
-									<th>Base URL</th>
-									<th>模型</th>
-									<th>状态</th>
-									<th style="width: 190px;">操作</th>
-								</tr>
-							</thead>
-							<tbody id="providers-table-body">
-								<!-- Provider rows -->
-							</tbody>
-						</table>
+						<div class="list-stack" id="providers-list">
+							<!-- Provider cards -->
+						</div>
 					</div>
 				</div>
 
@@ -8712,8 +9232,8 @@ async function handleAdminPage(request, env, ctx) {
 					<button class="btn btn-secondary" onclick="addQuotaMemberRow()" style="padding: 6px 12px; font-size: 12px;">添加成员</button>
 				</div>
 
-				<div style="display: grid; grid-template-columns: 1.2fr 1.5fr 86px 78px 72px 34px; gap: 8px; font-size: 12px; color: var(--text-muted);">
-					<span>渠道</span><span>上游模型名</span><span>上限</span><span>单位</span><span>状态</span><span></span>
+				<div style="display: grid; grid-template-columns: 56px 1.2fr 1.5fr 78px 72px 72px 34px; gap: 8px; font-size: 12px; color: var(--text-muted);">
+					<span title="数字越小越先用；同一层内仍然按负载均衡分摊">优先</span><span>渠道</span><span>上游模型名</span><span>上限</span><span>单位</span><span>状态</span><span></span>
 				</div>
 				<div id="quota-members" style="display: flex; flex-direction: column; gap: 10px;"></div>
 
@@ -8748,9 +9268,13 @@ async function handleAdminPage(request, env, ctx) {
 		let customMappings = {};
 		let mappingInvalid = {};
 		let mappingCfEnabled = true;
+		// 逐条映射开关：已停用的源名集合（loadSettings 从 /api/settings 拿）
+		let disabledMappings = new Set();
 		// 分组折叠状态：cf=null 表示首次加载还没初始化（loadSettings 里按当前模式决定默认是否折叠，
 		// 之后尊重用户手动展开）；provider 组默认收起。
-		const mappingGroupCollapsed = { cf: null, provider: true };
+		// 模型映射的两个分组（CF / 第三方渠道）**默认全部折叠**（2026-10-09 用户要求）。
+		// 以前 cf 组会按「当前模式是否生效」自动展开，导致进页面就看到一长条 —— 现统一默认收起。
+		const mappingGroupCollapsed = { cf: true, provider: true };
 		let providersCache = [];
 		let runtimeState = { cfPoolEnabled: true, defaultProviderId: '', accounts: 0 };
 		let healthProviderId = null;
@@ -8761,6 +9285,10 @@ async function handleAdminPage(request, env, ctx) {
 			// 模型名会随时间过期（Gemini 的 2.5 系列已对新用户关闭），填的是当前可用的示例值；
 			// 拿不准就用弹窗里的「从上游拉取模型列表」
 			{ key: 'gemini', label: 'Google Gemini（官方 OpenAI 兼容层）', baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai', name: 'gemini', models: ['gemini-3.8-flash'] },
+			// 2026-10-09 NVIDIA NIM 适配配套：build.nvidia.com 免费托管档（40 RPM/每 key）。
+			// key 是 nvapi- 开头，在 build.nvidia.com 免费领；模型名带斜杠是目录 ID 的正常形态，
+			// 更多模型用弹窗里的「从上游拉取模型列表」一键补全。
+			{ key: 'nvidia', label: 'NVIDIA NIM', baseUrl: 'https://integrate.api.nvidia.com/v1', name: 'nvidia', models: ['nvidia/llama-3.3-nemotron-super-49b-v1.5', 'z-ai/glm-5.1', 'qwen/qwen3-235b-a22b'] },
 			{ key: 'claude', label: 'Anthropic Claude（官方 OpenAI 兼容层）', baseUrl: 'https://api.anthropic.com/v1', name: 'claude', models: ['claude-sonnet-4-5'] },
 			{ key: 'openai', label: 'OpenAI', baseUrl: 'https://api.openai.com/v1', name: 'openai', models: ['gpt-4o', 'gpt-4o-mini'] },
 			{ key: 'deepseek', label: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', name: 'deepseek', models: ['deepseek-chat', 'deepseek-reasoner'] },
@@ -9581,31 +10109,37 @@ async function handleAdminPage(request, env, ctx) {
 			try {
 				const res = await apiFetch('/api/accounts');
 				const accounts = await res.json();
-				const tbody = document.getElementById('accounts-table-body');
-				tbody.innerHTML = '';
+				const list = document.getElementById('accounts-list');
+				list.innerHTML = '';
 				if (accounts.length === 0) {
-					tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; color: var(--text-muted); padding: 30px;">暂无配置的 Cloudflare 账号</td></tr>';
+					list.innerHTML = '<div style="text-align:center; color: var(--text-muted); padding: 30px;">暂无配置的 Cloudflare 账号</div>';
 					return;
 				}
 				accounts.forEach(acc => {
 					const maskedToken = acc.apiToken.length > 8 ? acc.apiToken.substring(0, 4) + '...' + acc.apiToken.substring(acc.apiToken.length - 4) : '********';
-					const tr = document.createElement('tr');
-					tr.innerHTML = \`
-						<td><strong style="font-weight:600;">\${sen(acc.name)}</strong></td>
-						<td><code>\${sen(acc.accountId.length > 12 ? acc.accountId.substring(0, 6) + '...' + acc.accountId.substring(acc.accountId.length - 4) : '********')}</code></td>
-						<td><code>\${sen(maskedToken)}</code></td>
-						<td>
-							<div style="display:flex; gap:8px;">
-								<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px;" data-acc-edit="\${sen(acc.id)}">编辑</button>
-								<button class="btn btn-danger" style="padding:6px 12px; font-size:12px; border-radius:6px;" data-acc-del="\${sen(acc.id)}">删除</button>
-							</div>
-						</td>
-					\`;
-					// ⚠️ 不再把用户数据拼进内联 onclick（值里含单引号即破坏按钮 JS，含特殊构造还能注入 → 存储型 XSS）。
-					// 改用 data 属性 + 事件绑定；闭包直接捕获 acc，连查表都省了。
-					tr.querySelector('[data-acc-edit]').onclick = () => editAccount(acc);
-					tr.querySelector('[data-acc-del]').onclick = () => deleteAccount(acc.id);
-					tbody.appendChild(tr);
+					const maskedId = acc.accountId.length > 12 ? acc.accountId.substring(0, 6) + '...' + acc.accountId.substring(acc.accountId.length - 4) : '********';
+					const card = document.createElement('div');
+					card.className = 'list-card';
+					card.innerHTML = '<div class="list-head" onclick="toggleListCard(this)">'
+						+ '<span class="list-arrow">▸</span>'
+						+ '<span class="list-title">' + sen(acc.name) + '</span>'
+						+ '<span class="list-meta">' + sen(maskedId) + '</span>'
+						+ '<span class="list-spacer"></span>'
+						+ '<span class="list-meta">展开</span>'
+						+ '</div>'
+						+ '<div class="list-body">'
+						+ '<div class="list-row"><span class="list-label">Account ID</span><code style="font-size:12px;">' + sen(maskedId) + '</code></div>'
+						+ '<div class="list-row"><span class="list-label">API Token</span><code style="font-size:12px;">' + sen(maskedToken) + '</code></div>'
+						+ '<div class="list-actions">'
+						+ '<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px;" data-acc-edit>编辑</button>'
+						+ '<button class="btn btn-danger" style="padding:6px 12px; font-size:12px; border-radius:6px;" data-acc-del>删除</button>'
+						+ '</div>'
+						+ '</div>';
+					// 不把用户数据拼进内联 onclick（含单引号即破坏按钮 JS、含特殊构造还能注入）
+					// 改用事件绑定；闭包直接捕获 acc，连查表都省了。
+					card.querySelector('[data-acc-edit]').onclick = () => editAccount(acc);
+					card.querySelector('[data-acc-del]').onclick = () => deleteAccount(acc.id);
+					list.appendChild(card);
 				});
 			} catch (e) {
 				console.error(e);
@@ -9839,59 +10373,62 @@ async function handleAdminPage(request, env, ctx) {
 			try {
 				const res = await apiFetch('/api/keys');
 				const keys = await res.json();
-			const tbody = document.getElementById('keys-table-body');
-			tbody.innerHTML = '';
-			const userKeys = keys.filter(k => !k.system);
-			if (userKeys.length === 0) {
-				document.getElementById('no-key-warning').classList.remove('hidden');
-			} else {
-				document.getElementById('no-key-warning').classList.add('hidden');
-			}
-			const now = Date.now();
-			keys.forEach(k => {
-				const tr = document.createElement('tr');
-				const isSystem = !!k.system;
-				const dateStr = k.createdAt ? new Date(k.createdAt).toLocaleString() : '—';
-				// 有效期 / 轮换状态列
-				let statusCell;
-				if (isSystem) {
-					statusCell = k.rotationEnabled
-						? '自动轮换<br><span style="font-size:11px;color:var(--text-muted);">下次 ' + (k.nextRotationAt ? new Date(k.nextRotationAt).toLocaleDateString() : '—') + '</span>'
-						: '永久（手动管理）';
-				} else if (k.expiresAt) {
-					statusCell = k.expiresAt > now
-						? '<span style="color:var(--success-color);">有效</span> 至 ' + new Date(k.expiresAt).toLocaleDateString()
-						: '<span style="color:var(--danger-color);">已过期</span>';
+				const list = document.getElementById('keys-list');
+				list.innerHTML = '';
+				const userKeys = keys.filter(k => !k.system);
+				if (userKeys.length === 0) {
+					document.getElementById('no-key-warning').classList.remove('hidden');
 				} else {
-					statusCell = '永久';
+					document.getElementById('no-key-warning').classList.add('hidden');
 				}
-				tr.innerHTML = \`
-					<td><strong style="font-weight:600;">\${sen(k.name)}</strong>\${isSystem ? ' <span style="font-size:11px;color:var(--text-muted);">（系统默认 · 不可删）</span>' : ''}</td>
-					<td>
-						<div style="display:flex; align-items:center; gap:8px;">
-							<code id="key-val-\${isSystem ? 'system' : k.id}">\${k.key.length > 6 ? k.key.substring(0, 5) + '...' + k.key.substring(k.key.length - 1) : k.key.substring(0, Math.min(3, k.key.length)) + '...'}</code>
-							<button class="btn btn-secondary" style="padding:4px 8px; font-size:11px; border-radius:6px;" data-copy="\${sen(k.key)}">复制</button>
-						</div>
-					</td>
-					<td>\${dateStr}</td>
-					<td style="font-size:13px;">\${statusCell}</td>
-					<td>
-						\${isSystem
+				const now = Date.now();
+				keys.forEach(k => {
+					const isSystem = !!k.system;
+					const dateStr = k.createdAt ? new Date(k.createdAt).toLocaleString() : '—';
+					// 摘要（行内短标签）与明细（展开后完整说明）分开，行内不塞 br
+					let statusShort, statusDetail;
+					if (isSystem) {
+						statusShort = k.rotationEnabled ? '自动轮换' : '永久';
+						statusDetail = k.rotationEnabled
+							? ('自动轮换，下次 ' + (k.nextRotationAt ? new Date(k.nextRotationAt).toLocaleDateString() : '—'))
+							: '永久（手动管理）';
+					} else if (k.expiresAt) {
+						statusShort = k.expiresAt > now ? '有效' : '已过期';
+						statusDetail = k.expiresAt > now
+							? ('有效至 ' + new Date(k.expiresAt).toLocaleDateString())
+							: ('已于 ' + new Date(k.expiresAt).toLocaleDateString() + ' 过期');
+					} else {
+						statusShort = '永久';
+						statusDetail = '永久';
+					}
+					const masked = k.key.length > 6 ? k.key.substring(0, 5) + '...' + k.key.substring(k.key.length - 1) : k.key.substring(0, Math.min(3, k.key.length)) + '...';
+					const card = document.createElement('div');
+					card.className = 'list-card';
+					card.innerHTML = '<div class="list-head" onclick="toggleListCard(this)">'
+						+ '<span class="list-arrow">▸</span>'
+						+ '<span class="list-title">' + sen(k.name) + '</span>'
+						+ (isSystem ? '<span class="badge badge-info">系统默认 · 不可删</span>' : '')
+						+ '<span class="list-spacer"></span>'
+						+ '<span class="list-meta">' + sen(statusShort) + '</span>'
+						+ '</div>'
+						+ '<div class="list-body">'
+						+ '<div class="list-row"><span class="list-label">创建时间</span><span style="font-size:12px;">' + sen(dateStr) + '</span></div>'
+						+ '<div class="list-row"><span class="list-label">有效期</span><span style="font-size:12px;">' + sen(statusDetail) + '</span></div>'
+						+ '<div class="list-row"><span class="list-label">密钥</span><span class="key-cell" title="点击复制完整密钥" data-copy-key>' + sen(masked) + '</span></div>'
+						+ '<div class="list-actions">'
+						+ (isSystem
 							? '<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px;" data-regen>重新生成</button>'
-							: '<button class="btn btn-danger" style="padding:6px 12px; font-size:12px; border-radius:6px;" data-del="' + k.id + '">删除</button>'}
-					</td>
-				\`;
-				if (isSystem) {
-					tr.querySelector('[data-regen]').onclick = regenerateSystemKey;
-				} else {
-					tr.querySelector('[data-del]').onclick = () => deleteKey(k.id);
-				}
-				// 复制按钮：值经 sen() 转义后放 data 属性（dataset 会自动解码回原文），不用内联 onclick 拼字符串
-				const copyBtn = tr.querySelector('[data-copy]');
-				if (copyBtn) copyBtn.onclick = () => copyKeyText(copyBtn.dataset.copy);
-				tbody.appendChild(tr);
-			});
-			loadRotationState();
+							: '<button class="btn btn-danger" style="padding:6px 12px; font-size:12px; border-radius:6px;" data-del>删除</button>')
+						+ '</div>'
+						+ '</div>';
+					if (isSystem) card.querySelector('[data-regen]').onclick = regenerateSystemKey;
+					else card.querySelector('[data-del]').onclick = () => deleteKey(k.id);
+					// 点击密钥框直接复制完整密钥（不再单放「复制」按钮）；闭包捕获，不拼内联事件
+					const keyCell = card.querySelector('[data-copy-key]');
+					if (keyCell) keyCell.onclick = () => copyKeyText(k.key);
+					list.appendChild(card);
+				});
+				loadRotationState();
 			} catch (e) {
 				console.error(e);
 			}
@@ -10215,12 +10752,19 @@ async function handleAdminPage(request, env, ctx) {
 			showToast('运行模式已保存');
 		}
 
-		// 渠道模型列默认只露前几个，其余收起（模型名是「备忘录」，全列会把那一行撑很高）
-		const PROVIDER_MODELS_PREVIEW = 3;
+		// 渠道列表：紧凑卡片 + 点开展开（方案B，2026-10-09 用户拍板）。
+		// 模型是「备忘录」，展开后以 chips 横排；超 8 个先收成「+N 展开」，点一下铺开。
+		const PROVIDER_CHIP_PREVIEW = 8;
+
+		function providerChipHtml(m, h) {
+			const dotColor = !h ? 'var(--text-muted)' : (h.ok ? 'var(--success-color)' : 'var(--danger-color)');
+			const dotTitle = !h ? '尚未测试' : (h.ok ? '上次测试正常' : '上次测试失败');
+			return '<span class="chip" title="' + sen(dotTitle + ' · ' + m) + '"><span style="color:' + dotColor + ';">●</span> ' + sen(m) + '</span>';
+		}
 
 		async function loadProviders() {
 			try {
-				// 顺带拉今日调用统计：转发次数和探测（测试）次数分开显示在渠道名下面
+				// 顺带拉今日调用统计：转发次数和探测（测试）次数分开显示
 				const [provRes, statsRes] = await Promise.all([
 					apiFetch('/api/providers'),
 					apiFetch('/api/provider-stats?range=today').catch(() => null)
@@ -10232,57 +10776,63 @@ async function handleAdminPage(request, env, ctx) {
 					((st && st.providers) || []).forEach(x => { statsById[x.id] = x; });
 				} catch (e) { }
 				applyRuntimeState(runtimeState);
-				const tbody = document.getElementById('providers-table-body');
-				tbody.innerHTML = '';
+				const list = document.getElementById('providers-list');
+				list.innerHTML = '';
 				if (!providersCache.length) {
-					tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; color: var(--text-muted); padding: 30px;">暂无第三方渠道</td></tr>';
+					list.innerHTML = '<div style="text-align:center; color: var(--text-muted); padding: 30px;">暂无第三方渠道</div>';
 					return;
 				}
 				providersCache.forEach(p => {
-					const statusBadge = p.status === 'disabled'
-						? '<span class="badge badge-danger">已停用</span>'
-						: '<span class="badge badge-success">启用</span>';
+					const enabled = p.status !== 'disabled';
 					const healthMap = p.modelHealth || {};
-					// 模型列表当「备忘录」用，全列出来会把整行撑很高 —— 默认只露前几个，其余折起来
-					const modelLines = (p.models || []).map(m => {
-						const h = healthMap[m];
-						const dotColor = !h ? 'var(--text-muted)' : (h.ok ? 'var(--success-color)' : 'var(--danger-color)');
-						const dotTitle = !h ? '尚未测试' : (h.ok ? '上次测试正常' : '上次测试失败');
-						return '<span title="' + dotTitle + '" style="color:' + dotColor + ';">●</span> ' + sen(m);
-					});
-					let modelsText;
-					if (!modelLines.length) {
-						modelsText = '<span style="color: var(--text-muted);">未填写</span>';
-					} else if (modelLines.length <= PROVIDER_MODELS_PREVIEW) {
-						modelsText = modelLines.join('<br>');
+					const allChips = (p.models || []).map(m => providerChipHtml(m, healthMap[m]));
+					let chipsHtml;
+					if (!allChips.length) {
+						chipsHtml = '<span style="color: var(--text-muted); font-size:12px;">未填写</span>';
+					} else if (allChips.length <= PROVIDER_CHIP_PREVIEW) {
+						chipsHtml = allChips.join('');
 					} else {
-						const hiddenCount = modelLines.length - PROVIDER_MODELS_PREVIEW;
-						modelsText = '<div class="prov-models">'
-							+ modelLines.slice(0, PROVIDER_MODELS_PREVIEW).join('<br>')
-							+ '<div class="prov-models-rest" style="display:none;">' + modelLines.slice(PROVIDER_MODELS_PREVIEW).join('<br>') + '</div>'
-							+ '<button type="button" class="prov-models-toggle" data-rest="' + hiddenCount + '" onclick="toggleProviderModels(this)">…等 ' + hiddenCount + ' 个，点击展开</button>'
-							+ '</div>';
+						const rest = allChips.length - PROVIDER_CHIP_PREVIEW;
+						chipsHtml = allChips.slice(0, PROVIDER_CHIP_PREVIEW).join('')
+							+ '<span class="chip chip-more" data-rest="' + rest + '" onclick="expandProviderChips(this)">+' + rest + ' 展开</span>';
 					}
 					// 今日用量：转发与测试分开显示。测试同样消耗上游额度，且会计入配额判断
 					const st = statsById[p.id];
-					const usageText = st
-						? '<div style="font-size:11px; color: var(--text-muted); margin-top:4px;">今日转发 ' + st.req + ' · 测试 ' + (st.probeReq || 0) + ' 次</div>'
-						: '';
-				const fallbackText = usageText;
-					const tr = document.createElement('tr');
-					tr.innerHTML = \`
-						<td><strong style="font-weight:600;">\${sen(p.name)}</strong>\${fallbackText}</td>
-						<td><code style="word-break: break-all;">\${sen(p.baseUrl || '')}</code></td>
-						<td style="font-size:12px; line-height:1.7;">\${modelsText}</td>
-						<td>\${statusBadge}</td>
-						<td style="white-space: nowrap;">
-							<button class="btn btn-secondary" style="padding:6px 10px; font-size:12px; border-radius:6px; margin-right:6px;" onclick="openProviderHealthModal('\${p.id}')">测模型</button>
-							<button class="btn btn-secondary" style="padding:6px 10px; font-size:12px; border-radius:6px; margin-right:6px;" onclick="openModelSpecModal('\${p.id}')">模型规格</button>
-							<button class="btn btn-secondary" style="padding:6px 10px; font-size:12px; border-radius:6px; margin-right:6px;" onclick="openProviderModal('\${p.id}')">编辑</button>
-							<button class="btn btn-danger" style="padding:6px 10px; font-size:12px; border-radius:6px;" onclick="deleteProvider('\${p.id}')">删除</button>
-						</td>
-					\`;
-					tbody.appendChild(tr);
+					const usageText = st ? ('今日转发 ' + st.req + ' · 测试 ' + (st.probeReq || 0) + ' 次') : '今日无调用';
+					const card = document.createElement('div');
+					card.className = 'list-card';
+					card.dataset.pid = p.id;
+					card.innerHTML = '<div class="list-head" onclick="toggleListCard(this)">'
+						+ '<span class="list-arrow">▸</span>'
+						+ '<span class="list-title">' + sen(p.name) + '</span>'
+						+ (enabled ? '<span class="badge badge-success">启用</span>' : '<span class="badge badge-danger">已停用</span>')
+						+ '<span class="list-meta">' + (p.models || []).length + ' 个模型</span>'
+						+ '<span class="list-meta">' + sen(usageText) + '</span>'
+						+ '<span class="list-spacer"></span>'
+						+ '<label class="switch" title="' + (enabled ? '点击停用' : '点击启用') + '" onclick="event.stopPropagation()">'
+						+ '<input type="checkbox" ' + (enabled ? 'checked' : '') + ' onchange="toggleProviderStatus(this)">'
+						+ '<span class="switch-track"></span>'
+						+ '</label>'
+						+ '</div>'
+						+ '<div class="list-body">'
+						+ '<div class="list-row"><span class="list-label">Base URL</span>'
+						+ '<span class="list-url" title="点击复制">' + sen(p.baseUrl || '') + '</span></div>'
+						+ '<div class="list-row"><span class="list-label">模型</span><span class="chips">' + chipsHtml + '</span></div>'
+						+ '<div class="list-actions">'
+						+ '<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px;" data-pp-health>测模型</button>'
+						+ '<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px;" data-pp-spec>模型规格</button>'
+						+ '<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px; border-radius:6px;" data-pp-edit>编辑</button>'
+						+ '<button class="btn btn-danger" style="padding:6px 12px; font-size:12px; border-radius:6px;" data-pp-del>删除</button>'
+						+ '</div>'
+						+ '</div>';
+					card.querySelector('[data-pp-health]').onclick = () => openProviderHealthModal(p.id);
+					card.querySelector('[data-pp-spec]').onclick = () => openModelSpecModal(p.id);
+					card.querySelector('[data-pp-edit]').onclick = () => openProviderModal(p.id);
+					card.querySelector('[data-pp-del]').onclick = () => deleteProvider(p.id);
+					// Base URL 点击复制：闭包捕获，不拼进内联事件
+					const urlEl = card.querySelector('.list-url');
+					if (urlEl) urlEl.onclick = () => copyKeyText(p.baseUrl || '');
+					list.appendChild(card);
 				});
 			} catch (e) {
 				console.error(e);
@@ -10941,7 +11491,9 @@ async function handleAdminPage(request, env, ctx) {
 					const c = quotaUsedCell(m, period);
 					return '<div style="display:grid; grid-template-columns: 20px 110px minmax(0,1fr) 110px 170px 76px; gap:10px; align-items:center; padding:8px 0; border-top:1px solid var(--border-color);">'
 						+ '<span style="font-size:12px; color: var(--text-muted);">' + (i + 1) + '</span>'
-						+ '<span style="font-size:12.5px; color: var(--text-muted); overflow-wrap:anywhere;">' + sen(m.providerName || '（已删除）') + '</span>'
+						+ '<span style="font-size:12.5px; color: var(--text-muted); overflow-wrap:anywhere;">' + sen(m.providerName || '（已删除）')
+						+ (Number(m.priority) > 1 ? ' <span class="badge badge-info" title="组内优先级：数字越小越先用；同层内仍按负载均衡分摊">优先 ' + Math.floor(Number(m.priority)) + '</span>' : '')
+						+ '</span>'
 						+ '<code style="font-size:12.5px; word-break:break-all;">' + sen(m.model) + '</code>'
 						+ '<div>' + c.bar + '</div>'
 						+ '<div style="font-size:12.5px;">' + c.right + '</div>'
@@ -10958,7 +11510,11 @@ async function handleAdminPage(request, env, ctx) {
 					+ (g.status === 'disabled' ? '<span class="badge badge-warning">已停用</span>' : '')
 					+ '<span style="font-size:12px; color:var(--text-muted);">' + sen(g.resetLabel || '') + '</span>'
 					+ '<span style="font-size:12px; color:var(--text-muted);">' + memberCount + ' 个成员</span>'
-					+ '<span style="margin-left:auto; display:flex; gap:8px;">'
+					+ '<span style="margin-left:auto; display:flex; gap:10px; align-items:center;">'
+					+ '<label class="switch" title="' + (g.status === 'disabled' ? '点击启用' : '点击停用') + '" onclick="event.stopPropagation()">'
+					+ '<input type="checkbox" data-gid="' + sen(g.id) + '"' + (g.status === 'disabled' ? '' : ' checked') + ' onchange="toggleQuotaGroupStatus(this)">'
+					+ '<span class="switch-track"></span>'
+					+ '</label>'
 					+ '<button class="btn btn-secondary" style="padding:6px 12px; font-size:12px;" data-id="' + sen(g.id) + '" onclick="event.stopPropagation(); openQuotaModal(this.dataset.id)">编辑</button>'
 					+ '<button class="btn btn-danger" style="padding:6px 12px; font-size:12px;" data-id="' + sen(g.id) + '" onclick="event.stopPropagation(); deleteQuotaGroup(this.dataset.id)">删除</button>'
 					+ '</span></div>'
@@ -10980,7 +11536,9 @@ async function handleAdminPage(request, env, ctx) {
 			).join('');
 			// 计量单位：'token' = 按 token 总量，其它（缺省）= 按请求条数
 			const unit = p.unit === 'token' ? 'token' : 'count';
-			return '<div class="quota-member-row" style="display: grid; grid-template-columns: 1.2fr 1.5fr 86px 78px 72px 34px; gap: 8px; align-items: center;">'
+			return '<div class="quota-member-row" style="display: grid; grid-template-columns: 56px 1.2fr 1.5fr 78px 72px 72px 34px; gap: 8px; align-items: center;">'
+				// 组内优先级：数字越小越先用；同优先级的人之间仍然按负载均衡分摊（两者正交）
+				+ '<input type="number" class="quota-m-prio" min="1" step="1" placeholder="1" title="数字越小越先用；同一层内仍然按负载均衡分摊" value="' + (Number(p.priority) > 0 ? Math.floor(Number(p.priority)) : 1) + '" style="' + inputStyle + '">'
 				+ '<select class="quota-m-provider" onchange="syncQuotaRowModels(this)" style="' + inputStyle + '">' + opts + '</select>'
 				// 模型候选用自建下拉（2026-10-09 弃用原生 datalist，同映射页）：
 				// 包一层 .map-combo 作定位容器，面板绝对定位向下展开、盖在右侧几列之上
@@ -11300,6 +11858,8 @@ async function handleAdminPage(request, env, ctx) {
 				providerId: r.querySelector('.quota-m-provider').value,
 				model: r.querySelector('.quota-m-model').value.trim(),
 				limit: Math.max(0, Math.floor(Number(r.querySelector('.quota-m-limit').value) || 0)),
+				// 组内优先级：留空/非法一律回落 1（最高优先级）
+				priority: Math.max(1, Math.floor(Number((r.querySelector('.quota-m-prio') || {}).value) || 1)),
 				// 单位：只认 'token'，其余一律 'count'（与服务端白名单一致）
 				unit: (r.querySelector('.quota-m-unit') || {}).value === 'token' ? 'token' : 'count',
 				status: r.querySelector('.quota-m-status').value
@@ -11378,7 +11938,10 @@ async function handleAdminPage(request, env, ctx) {
 			});
 			Object.keys(defaultMappings).forEach(k => push(defaultMappings[k]));
 			mapTargetCandidates = opts;
-			renderMapTargetMenu('');
+			// ★ 只填内容、不弹开（withOpen=false）：切到映射页（loadSettings）时刷新候选，
+			//   旧实现走 renderMapTargetMenu → withOpen=true → 面板没点就自动弹开、还盖住
+			//   下方的映射表格（2026-10-09 用户截图报障）。开合只归 focus/input 事件管。
+			fillComboMenu(menu, mapTargetCandidates, '', false);
 		}
 
 		// 渲染候选内容的公共件（映射页 + 配额成员行共用）：
@@ -11486,8 +12049,7 @@ async function handleAdminPage(request, env, ctx) {
 				customMappings = data.customModelMap || {};
 				mappingInvalid = data.invalid || {};
 				mappingCfEnabled = data.cfPoolEnabled !== false;
-				// 当前模式下不生效的那组默认折叠（只初始化一次，之后尊重用户手动展开）
-				if (mappingGroupCollapsed.cf === null) mappingGroupCollapsed.cf = !mappingCfEnabled;
+				disabledMappings = new Set(Array.isArray(data.disabledMappings) ? data.disabledMappings : []);
 				refreshMappingTargetOptions();
 				renderMappings();
 			} catch (e) {
@@ -11522,15 +12084,24 @@ async function handleAdminPage(request, env, ctx) {
 
 		function mappingRowHtml(source, target) {
 			const problem = mappingInvalid[source];
+			// 逐条开关：被停用的行整行变淡 + 标红「已停用」，开关关掉
+			const off = disabledMappings.has(source);
 			const isPreset = Object.prototype.hasOwnProperty.call(defaultMappings, source) && defaultMappings[source] === target;
 			const typeText = (isPreset ? '<span class="badge badge-success">预设映射</span>' : '<span class="badge badge-warning">自定义</span>')
+				+ (off ? ' <span class="badge badge-danger">已停用</span>' : '')
 				+ (problem ? ' <span class="badge badge-danger">未生效</span>' : '')
 				+ (problem ? '<div style="color: var(--danger-color); font-size:11.5px; margin-top:5px; max-width:220px; white-space:normal; line-height:1.5;">' + sen(problem) + '</div>' : '');
-			return '<tr>'
+			return '<tr' + (off ? ' style="opacity:.55;"' : '') + '>'
 				+ '<td><code style="cursor:pointer;" title="点击复制" data-copy="' + sen(source) + '" onclick="copyModelId(this.dataset.copy)">' + sen(source) + '</code></td>'
 				+ '<td><code style="cursor:pointer; word-break:break-all;" title="点击复制" data-copy="' + sen(target) + '" onclick="copyModelId(this.dataset.copy)">' + sen(target) + '</code>' + costTierBadge(target) + '</td>'
 				+ '<td>' + typeText + '</td>'
-				+ '<td><button class="btn btn-danger" style="padding:6px 12px; font-size:12px; border-radius:6px;" data-del="' + sen(source) + '" onclick="deleteMapping(this.dataset.del)">删除</button></td>'
+				+ '<td style="white-space:nowrap;">'
+				+ '<label class="switch" title="' + (off ? '点击启用这条映射' : '点击停用这条映射') + '" style="vertical-align:middle;">'
+				+ '<input type="checkbox" data-src="' + sen(source) + '"' + (off ? '' : ' checked') + ' onchange="toggleMappingStatus(this)">'
+				+ '<span class="switch-track"></span>'
+				+ '</label>'
+				+ '<button class="btn btn-danger" style="padding:6px 12px; font-size:12px; border-radius:6px; margin-left:10px;" data-del="' + sen(source) + '" onclick="deleteMapping(this.dataset.del)">删除</button>'
+				+ '</td>'
 				+ '</tr>';
 		}
 
@@ -11584,20 +12155,74 @@ async function handleAdminPage(request, env, ctx) {
 			if (id) { if (open) quotaOpenGroups[id] = true; else delete quotaOpenGroups[id]; }
 		}
 
-		// 渠道模型列的「展开 / 收起」：默认只露前几个，点按钮切换
-		function toggleProviderModels(btn) {
-			const box = btn.closest('.prov-models');
-			if (!box) return;
-			const rest = box.querySelector('.prov-models-rest');
-			if (!rest) return;
-			const opening = rest.style.display === 'none';
-			rest.style.display = opening ? '' : 'none';
-			btn.textContent = opening ? '收起' : ('…等 ' + (btn.dataset.rest || '') + ' 个，点击展开');
+		// 配额组外置启用/停用开关：整体启用或停用某个组（2026-10-09 用户要求）。
+		// 停用后 TT:<组名> 会显式报「组未启用」，不参与选号；不用进编辑弹窗。
+		async function toggleQuotaGroupStatus(cb) {
+			const gid = cb.dataset.gid;
+			if (!gid) return;
+			const status = cb.checked ? 'active' : 'disabled';
+			const res = await apiFetch('/api/quota-groups/status', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ id: gid, status })
+			});
+			if (!res.ok) { showToast('切换失败', 'error'); loadQuotaGroups(); return; }
+			showToast(status === 'active' ? '已启用该配额组' : '已停用该配额组');
+			loadQuotaGroups();
+		}
+
+		// 通用：紧凑列表卡片（渠道 / 账号 / 密钥）「点标题行展开」
+		function toggleListCard(head) {
+			const card = head.closest('.list-card');
+			if (!card) return;
+			const open = card.classList.toggle('open');
+			const arrow = card.querySelector('.list-arrow');
+			if (arrow) arrow.textContent = open ? '▾' : '▸';
+		}
+
+		// 渠道模型 chips：点「+N 展开」把该渠道全部模型铺开
+		function expandProviderChips(el) {
+			const card = el.closest('.list-card');
+			const p = card && providersCache.find(x => x.id === card.dataset.pid);
+			if (!p) return;
+			const healthMap = p.modelHealth || {};
+			const chips = el.parentElement;
+			if (chips) chips.innerHTML = (p.models || []).map(m => providerChipHtml(m, healthMap[m])).join('');
+		}
+
+		// 渠道外置启用/停用开关：直接切状态，不用进编辑框（2026-10-09 用户要求）
+		async function toggleProviderStatus(cb) {
+			const card = cb.closest('.list-card');
+			const pid = card && card.dataset.pid;
+			if (!pid) return;
+			const status = cb.checked ? 'active' : 'disabled';
+			const res = await apiFetch('/api/providers/status', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ id: pid, status })
+			});
+			if (!res.ok) { showToast('切换失败', 'error'); loadProviders(); return; }
+			showToast(status === 'active' ? '已启用该渠道' : '已停用该渠道');
+			loadProviders();
 		}
 
 		function toggleMappingGroup(key) {
 			mappingGroupCollapsed[key] = !mappingGroupCollapsed[key];
 			renderMappings();
+		}
+
+		// 单条映射的启用/停用（映射表每行的小开关）：只改 config.disabledMappings，不删映射。
+		async function toggleMappingStatus(cb) {
+			const source = cb.dataset.src;
+			if (!source) return;
+			const res = await apiFetch('/api/mappings/status', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ source, enabled: cb.checked })
+			});
+			if (!res.ok) { showToast('切换失败', 'error'); loadSettings(); return; }
+			showToast(cb.checked ? '已启用该映射' : '已停用该映射');
+			loadSettings();
 		}
 
 		async function addMapping() {
@@ -11616,6 +12241,15 @@ async function handleAdminPage(request, env, ctx) {
 			if (!res.ok) {
 				showToast('添加映射失败！', 'error');
 				return;
+			}
+
+			// 重新添加/修改这条映射 = 用户希望它生效 → 顺手清掉该源的「已停用」标记
+			if (disabledMappings.has(source)) {
+				await apiFetch('/api/mappings/status', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ source, enabled: true })
+				});
 			}
 
 			const data = await res.json().catch(() => ({}));
