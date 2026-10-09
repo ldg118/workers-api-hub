@@ -10,7 +10,7 @@
 // ★★ 硬约定：**每次改动 _worker.js 都要把版本号 +1**（日期变了就换新日期，**序号继续递增、不重置**）。
 //    格式固定 `YYYY-MM-DD.N`。验证脚本会拦下格式不对的值，但「有没有 +1」只能靠自觉 ——
 //    曾经因为版本号没变，本地/线上分不清哪个是哪版，白排查了一整轮。
-const BUILD_ID = '2026-10-09.136';
+const BUILD_ID = '2026-10-09.141';
 
 // 系统默认密钥自动轮换参数
 const ROTATE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000; // 轮换周期：7 天
@@ -5201,6 +5201,12 @@ async function handleDashboardApi(request, env, ctx) {
 					found = true;
 					// 编辑时密钥留空或仍是掩码，则保留原值
 					const nextKey = (!apiKey || apiKey.includes('...') || apiKey === '********') ? p.apiKey : apiKey;
+					// 模型列表变了就顺手清掉「已不在列表里」的健康记录。
+					// 不清的话：删掉一个坏模型后，改天同名模型再加回来，会看到一条过期的红点/过期建议，
+					// 让人以为新加的也是坏的（而在健康面板里直接删模型正是为了不混淆）。
+					const nextHealth = p.modelHealth
+						? Object.fromEntries(Object.entries(p.modelHealth).filter(([k]) => modelList.includes(k)))
+						: p.modelHealth;
 					return {
 						...p,
 						name,
@@ -5208,7 +5214,8 @@ async function handleDashboardApi(request, env, ctx) {
 						apiKey: nextKey,
 						models: modelList,
 					status: status || p.status || 'active',
-					geminiNative: gnFlag
+					geminiNative: gnFlag,
+					modelHealth: nextHealth
 					};
 				});
 				if (!found) {
@@ -7505,6 +7512,8 @@ async function handleAdminPage(request, env, ctx) {
 			top: calc(100% + 4px); /* 只向下；不做向上翻转 */
 			max-height: 200px;
 			overflow-y: auto;
+			/* 滚到面板顶/底后别再「穿透」给弹窗 —— 否则看着像在滑整个弹窗（2026-10-09） */
+			overscroll-behavior: contain;
 			padding: 4px;
 			background-color: var(--card-bg);
 			border: 1px solid var(--border-color);
@@ -7556,6 +7565,8 @@ async function handleAdminPage(request, env, ctx) {
 			max-width: min(520px, calc(100vw - 64px));
 			max-height: 320px;
 			overflow-y: auto;
+			/* 同配额预设面板：滚到头不再把滚动「穿透」给 .modal-body / 页面（2026-10-09） */
+			overscroll-behavior: contain;
 			padding: 4px;
 			background-color: var(--card-bg);
 			border: 1px solid var(--border-color);
@@ -8154,6 +8165,13 @@ async function handleAdminPage(request, env, ctx) {
 
 		.modal-overlay.active .confirm-card {
 			transform: scale(1) translateY(0);
+		}
+
+		/* 确认框必须永远盖在其它弹窗之上：它常在弹窗内部被调用（「测模型」弹窗里删模型、换用它）。
+		   两边 z-index 都是 1000 时谁在上由 DOM 顺序决定，而 #confirm-modal 在 DOM 里排得更靠前 →
+		   确认框被压在下面看不见，用户得先关掉上层弹窗才看得到（2026-10-09 实测反馈）。 */
+		#confirm-modal {
+			z-index: 2000;
 		}
 
 		.confirm-icon {
@@ -9097,7 +9115,7 @@ async function handleAdminPage(request, env, ctx) {
 							<th style="width: 76px;">状态</th>
 							<th style="width: 76px;">耗时</th>
 							<th>详情</th>
-							<th style="width: 64px;">操作</th>
+							<th style="width: 110px;">操作</th>
 						</tr>
 					</thead>
 					<tbody id="health-table-body">
@@ -11155,7 +11173,10 @@ async function handleAdminPage(request, env, ctx) {
 					'<td>' + badge + '</td>' +
 					'<td style="font-size:12px;">' + elapsed + '</td>' +
 					'<td style="font-size:12px; line-height:1.6; word-break:break-word;"' + detailTitle + '>' + detail + hint + sugBlock + '</td>' +
-					'<td><button class="btn btn-secondary" style="padding:4px 8px; font-size:11px; border-radius:6px;" onclick="testOneModelAt(' + idx + ')">重测</button></td>';
+					'<td><div style="display:flex; gap:6px; align-items:center; white-space:nowrap;">'
+						+ '<button class="btn btn-secondary" style="padding:4px 8px; font-size:11px; border-radius:6px;" onclick="testOneModelAt(' + idx + ')">重测</button>'
+						+ '<button class="btn btn-danger" style="padding:4px 8px; font-size:11px; border-radius:6px;" title="从该渠道的模型列表里删掉它，不用退出重进" onclick="removeModelAt(' + idx + ')">删除</button>'
+						+ '</div></td>';
 				tbody.appendChild(tr);
 			});
 		}
@@ -11168,18 +11189,11 @@ async function handleAdminPage(request, env, ctx) {
 			runModelProbe([p.models[idx]]);
 		}
 
-		// 上游建议了替代模型名（如 Gemini 提示 2.5-flash 已下线、改用 3.8-flash），一键替换
-		async function useSuggestedModelAt(idx) {
-			const p = providersCache.find(x => x.id === healthProviderId);
-			if (!p || !p.models || !p.models[idx]) return;
-			const from = p.models[idx];
-			const h = healthResults[from] || (p.modelHealth || {})[from];
-			const to = h && h.suggestedModel;
-			if (!to) return;
-			if (!(await uiConfirm('把模型「' + from + '」替换为「' + to + '」？', { okText: '替换' }))) return;
-
-			const nextModels = p.models.map(m => m === from ? to : m);
-			const res = await apiFetch('/api/providers', {
+		// 用一份新的模型列表回写渠道（编辑弹窗之外的快捷改动：一键换名 / 健康面板里删模型）。
+		// ⚠️ 必须显式带上 geminiNative：POST 里未传 = undefined，JSON 序列化会把这个键丢掉 →
+		//    等于把「原生 / 兼容」开关悄悄重置成「自动」。status 同理不能漏。
+		async function saveProviderModels(p, nextModels) {
+			return apiFetch('/api/providers', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({
@@ -11191,12 +11205,43 @@ async function handleAdminPage(request, env, ctx) {
 					geminiNative: p.geminiNative
 				})
 			});
+		}
+
+		// 上游建议了替代模型名（如 Gemini 提示 2.5-flash 已下线、改用 3.8-flash），一键替换
+		async function useSuggestedModelAt(idx) {
+			const p = providersCache.find(x => x.id === healthProviderId);
+			if (!p || !p.models || !p.models[idx]) return;
+			const from = p.models[idx];
+			const h = healthResults[from] || (p.modelHealth || {})[from];
+			const to = h && h.suggestedModel;
+			if (!to) return;
+			if (!(await uiConfirm('把模型「' + from + '」替换为「' + to + '」？', { okText: '替换' }))) return;
+
+			const res = await saveProviderModels(p, p.models.map(m => m === from ? to : m));
 			if (!res.ok) {
 				showToast('替换失败', 'error');
 				return;
 			}
 			delete healthResults[from];
 			showToast('已把 ' + from + ' 换成 ' + to);
+			await loadProviders();
+			renderHealthTable();
+		}
+
+		// 健康面板里直接删掉这个模型 —— 坏模型不用退出去编辑渠道，免得回来忘了到底是哪个有问题
+		async function removeModelAt(idx) {
+			const p = providersCache.find(x => x.id === healthProviderId);
+			if (!p || !p.models || !p.models[idx]) return;
+			const m = p.models[idx];
+			if (!(await uiConfirm('从渠道「' + p.name + '」里删除模型「' + m + '」？', { okText: '删除' }))) return;
+
+			const res = await saveProviderModels(p, p.models.filter(x => x !== m));
+			if (!res.ok) {
+				showToast('删除失败', 'error');
+				return;
+			}
+			delete healthResults[m];
+			showToast('已删除模型 ' + m);
 			await loadProviders();
 			renderHealthTable();
 		}
@@ -11618,13 +11663,9 @@ async function handleAdminPage(request, env, ctx) {
 			[].slice.call(menu.querySelectorAll('.quota-combo-item')).forEach(function (it) {
 				it.classList.toggle('on', it.dataset.value === cur);
 			});
-			// 展开后保证菜单整块可见（弹窗内容区可滚动）—— 这是「只向下弹」的配套，不会遮挡上面的字段
-			const body = combo.closest('.modal-body');
-			if (body) {
-				const mr = menu.getBoundingClientRect();
-				const br = body.getBoundingClientRect();
-				if (mr.bottom > br.bottom) body.scrollTop += (mr.bottom - br.bottom) + 8;
-			}
+			// 展开后贴住可见区（弹窗内容区可滚动）—— 「只向下弹」的配套：
+			// 被 .modal-body 裁到就往上拉，再按剩余空间收高度（共用 map-combo 那套，2026-10-09）
+			fitComboMenu(menu);
 		}
 
 		function quotaComboToggle(inputId) {
@@ -11944,6 +11985,27 @@ async function handleAdminPage(request, env, ctx) {
 			fillComboMenu(menu, mapTargetCandidates, '', false);
 		}
 
+		// 面板「贴住可见区」——2026-10-09 修（用户报「模型多了，滑动带动整个窗口」）。
+		// 面板是 .map-combo 下的绝对定位子元素，会被**最近的滚动容器**（弹窗的 .modal-body）裁掉：
+		// 无头 Chrome + 真实滚轮实测 —— 弹窗里靠底部的成员行，面板整块落到 .modal-body 下沿之外，
+		// 滚轮命中的是 .modal-body 而不是面板 → 滚的是整个弹窗，列表纹丝不动。
+		// 这里先「尽量」把它拉进可见区，再把高度收到可见区剩余空间以内：面板自带滚动、不再被裁。
+		function fitComboMenu(menu) {
+			if (!menu) return;
+			menu.style.maxHeight = '';   // 先按原始高度量（上一次留下的限制会干扰取数）
+			const cssMax = parseFloat(getComputedStyle(menu).maxHeight) || 320;
+			const box = menu.closest('.modal-body');   // 弹窗内的面板被它裁；映射页（非弹窗）没有这层
+			const room = () => {
+				const bottom = box ? box.getBoundingClientRect().bottom : window.innerHeight;
+				return Math.min(window.innerHeight, bottom) - menu.getBoundingClientRect().top - 6;
+			};
+			const need = Math.min(cssMax, menu.getBoundingClientRect().height) + 4;   // 面板「想要」多高
+			// 还被裁就往上拉（最多 3 次：拉不动说明内容已经到底，别在这死循环）
+			for (let i = 0; box && i < 3 && room() < need; i++) box.scrollTop += (need - room());
+			// 兜底 88px：空间实在不够时宁可留一点裁切，也别把面板压成一条缝、点不动
+			menu.style.maxHeight = Math.max(88, Math.min(cssMax, room())) + 'px';
+		}
+
 		// 渲染候选内容的公共件（映射页 + 配额成员行共用）：
 		// 按关键字小写包含过滤；withOpen=true 时同时按「有无结果」开合面板
 		function fillComboMenu(menu, candidates, kwRaw, withOpen) {
@@ -11954,7 +12016,10 @@ async function handleAdminPage(request, env, ctx) {
 			).join('');
 			if (withOpen) {
 				const combo = menu.closest('.map-combo');
-				if (combo) combo.classList.toggle('open', items.length > 0);
+				if (combo) {
+					combo.classList.toggle('open', items.length > 0);
+					if (items.length) fitComboMenu(menu);   // 展开后贴住可见区（否则被 .modal-body 裁掉）
+				}
 			}
 		}
 
