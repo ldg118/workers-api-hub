@@ -10,7 +10,7 @@
 // ★★ 硬约定：**每次改动 _worker.js 都要把版本号 +1**（日期变了就换新日期，**序号继续递增、不重置**）。
 //    格式固定 `YYYY-MM-DD.N`。验证脚本会拦下格式不对的值，但「有没有 +1」只能靠自觉 ——
 //    曾经因为版本号没变，本地/线上分不清哪个是哪版，白排查了一整轮。
-const BUILD_ID = '2026-10-08.114';
+const BUILD_ID = '2026-10-09.118';
 
 // 系统默认密钥自动轮换参数
 const ROTATE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000; // 轮换周期：7 天
@@ -6873,54 +6873,9 @@ async function handleAdminPage(request, env, ctx) {
 		main {
 			flex: 1;
 			margin-left: var(--sidebar-width);
-			padding: 40px;
+			padding: 24px 40px 40px;
 			min-width: 0;
 			z-index: 10;
-		}
-
-		header {
-			display: flex;
-			justify-content: space-between;
-			align-items: center;
-			margin-bottom: 30px;
-			gap: 16px;
-		}
-
-		/* 页面标题右侧：主题切换 + 退出登录（原本在侧边栏底部） */
-		.view-actions {
-			display: flex;
-			align-items: center;
-			gap: 8px;
-			flex-shrink: 0;
-		}
-
-		.view-actions .btn {
-			height: 36px;
-			padding: 0 13px;
-			display: flex;
-			align-items: center;
-			gap: 6px;
-			font-size: 13px;
-			white-space: nowrap;
-		}
-
-		/* 窄屏：标题与操作挤在一起，按钮退化成纯图标 */
-		@media (max-width: 760px) {
-			header {
-				gap: 12px;
-			}
-
-			header h1 {
-				font-size: 20px !important;
-			}
-
-			.view-actions .btn-label {
-				display: none;
-			}
-
-			.view-actions .btn {
-				padding: 0 10px;
-			}
 		}
 
 		/* Card Grid & Stats */
@@ -7189,6 +7144,57 @@ async function handleAdminPage(request, env, ctx) {
 		/* 当前值对应的那项高亮 —— 免得"点开发现第一项就是现在这个"让人困惑 */
 		.quota-combo-item.on {
 			color: var(--accent-color);
+		}
+
+		/* 模型映射「目标模型」的自定义候选下拉。原生 datalist 的弹出面板不受 CSS 控制
+		   （字体小、宽度窄、长模型名截断，2026-10-09 用户要求变大），改自建；
+		   教训同配额「重置基准」：只向下展开、绝不向上翻。 */
+		.map-combo {
+			position: relative;
+		}
+		.map-combo-menu {
+			display: none;
+			position: absolute;
+			left: 0;
+			top: calc(100% + 4px);   /* 只向下；不做向上翻转 */
+			width: max-content;      /* 面板随内容加宽，长模型名不再截断 */
+			min-width: 100%;         /* 但至少与输入框对齐 */
+			max-width: min(520px, calc(100vw - 64px));
+			max-height: 320px;
+			overflow-y: auto;
+			padding: 4px;
+			background-color: var(--card-bg);
+			border: 1px solid var(--border-color);
+			border-radius: 10px;
+			box-shadow: var(--card-shadow);
+			z-index: 40;
+			scrollbar-width: thin;
+		}
+		.map-combo.open .map-combo-menu {
+			display: block;
+		}
+		.map-combo-item {
+			display: block;
+			width: 100%;
+			text-align: left;
+			padding: 10px 14px;
+			border: none;
+			border-radius: 8px;
+			background-color: transparent;
+			color: var(--text-main);
+			font-size: 14px;
+			font-family: inherit;
+			cursor: pointer;
+			white-space: nowrap;
+			overflow: hidden;
+			text-overflow: ellipsis;
+		}
+		.map-combo-item:hover {
+			background-color: var(--section-item-bg);
+		}
+		/* 配额弹窗的成员行也用同款下拉；卡片内容窄（约 436px），面板加宽上限收窄，免得顶出横向滚动 */
+		.quota-member-row .map-combo-menu {
+			max-width: min(320px, calc(100vw - 64px));
 		}
 
 		/* Buttons */
@@ -7883,6 +7889,22 @@ async function handleAdminPage(request, env, ctx) {
 					<svg style="width: 18px; height: 18px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
 					模型映射
 				</div>
+
+				<div class="nav-group-title">设置</div>
+				<div class="nav-item" id="menu-theme" onclick="toggleTheme()">
+					<svg class="theme-icon-sun" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none; width: 18px; height: 18px;">
+						<circle cx="12" cy="12" r="4" />
+						<path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41" />
+					</svg>
+					<svg class="theme-icon-moon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width: 18px; height: 18px;">
+						<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z" />
+					</svg>
+					切换主题
+				</div>
+				<div class="nav-item" id="menu-logout" onclick="logout()">
+					<svg style="width: 18px; height: 18px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path></svg>
+					退出登录
+				</div>
 			</div>
 
 			<div class="aside-footer">
@@ -7896,34 +7918,10 @@ async function handleAdminPage(request, env, ctx) {
 		<main>
 			<div id="auth-views" style="display: flex; flex-direction: column; gap: 30px; width: 100%;">
 				
-				<!-- Header -->
-				<header>
-					<div style="min-width: 0;">
-						<h1 style="font-size: 26px; font-weight: 700;" id="view-title">数据看板</h1>
-						<p style="color: var(--text-muted); font-size: 14px; margin-top: 4px;" id="view-subtitle"></p>
-					</div>
-					<div class="view-actions">
-						<button class="btn btn-secondary" onclick="toggleTheme()" title="切换日间/夜间模式">
-							<svg class="theme-icon-sun" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none; width: 16px; height: 16px;">
-								<circle cx="12" cy="12" r="4" />
-								<path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41" />
-							</svg>
-							<svg class="theme-icon-moon" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width: 16px; height: 16px;">
-								<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z" />
-							</svg>
-							<span class="btn-label">切换主题</span>
-						</button>
-						<button class="btn btn-secondary" onclick="logout()" title="退出登录">
-							<svg style="width: 16px; height: 16px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path></svg>
-							<span class="btn-label">退出登录</span>
-						</button>
-					</div>
-				</header>
-
 				<!-- TAB: Overview -->
 				<div id="tab-overview" class="tab-content${defaultTab === 'overview' ? ' active' : ''}">
 					<!-- 第三方渠道调用统计（与下方 CF 官方用量是两条独立数据源） -->
-					<div class="section-card" style="margin-top: 24px;">
+					<div class="section-card">
 						<div class="section-header">
 							<div class="section-title">第三方渠道调用</div>
 							<div style="display: flex; align-items: center; gap: 8px;">
@@ -8258,10 +8256,10 @@ async function handleAdminPage(request, env, ctx) {
 								<label>请求模型名</label>
 								<input type="text" id="map-source" placeholder="如: gpt-3.5-turbo">
 							</div>
-							<div class="form-group" style="margin-bottom: 0;">
+							<div class="form-group map-combo" style="margin-bottom: 0;">
 								<label>目标模型</label>
-								<input type="text" id="map-target" list="map-target-options" placeholder="下拉选已有模型，或直接手输">
-								<datalist id="map-target-options"></datalist>
+								<input type="text" id="map-target" placeholder="下拉选已有模型，或直接手输" autocomplete="off">
+								<div class="map-combo-menu" id="map-target-menu"></div>
 							</div>
 							<div style="display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap;">
 								<button class="btn btn-primary" onclick="addMapping()" style="height: 45px;">添加/修改</button>
@@ -9344,7 +9342,8 @@ async function handleAdminPage(request, env, ctx) {
 				anthropicUrlEl.dataset.endpointUrl = anthropicUrl;
 				anthropicUrlEl.textContent = anthropicUrl;
 			}
-			applyTabMeta(currentTab);
+			initMapTargetCombo();
+			initQuotaModelCombo();
 			loadRuntimeState();
 			loadAccessSample();
 			if (!document.body.classList.contains('cf-off')) {
@@ -9368,21 +9367,6 @@ async function handleAdminPage(request, env, ctx) {
 			}
 		}
 
-		const tabMeta = {
-			overview: ['数据看板', '第三方渠道调用统计与 Cloudflare 账号池用量总览'],
-			accounts: ['账号管理', '管理 Cloudflare 账号，请求随机打散并自动故障切换'],
-			access: ['接入信息', '把客户端接到这个代理上，点击地址即可复制'],
-			providers: ['第三方渠道', '接入任意 OpenAI 兼容端点，按模型名分流'],
-			settings: ['模型映射', '决定某个模型名最终走哪一个上游'],
-			quota: ['调用配额', '给一组候选模型设上限（次数或 token），按比例分摊、用满自动切换']
-		};
-
-		function applyTabMeta(tabName) {
-			const meta = tabMeta[tabName] || ['', ''];
-			document.getElementById('view-title').innerText = meta[0];
-			document.getElementById('view-subtitle').innerText = meta[1];
-		}
-
 		function switchTab(tabName) {
 			if (tabName === currentTab) return;
 			// 账号池关闭时对应界面被 CSS 隐藏，这里兜一下，避免切到看不见的 Tab
@@ -9398,7 +9382,6 @@ async function handleAdminPage(request, env, ctx) {
 			document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
 			tabEl.classList.add('active');
 
-			applyTabMeta(tabName);
 			document.getElementById('sidebar').classList.remove('active');
 
 			if (tabName === 'overview') {
@@ -10989,12 +10972,8 @@ async function handleAdminPage(request, env, ctx) {
 			}).join('');
 		}
 
-		let quotaRowSeq = 0;
-
 		function quotaEditRowHtml(m) {
 			const p = m || {};
-			// 每行一个独立的 datalist —— 模型候选要跟着该行的渠道变，不能共用同一个
-			const rid = 'qrow-' + (++quotaRowSeq);
 			const inputStyle = 'background-color: var(--input-bg); border: 1px solid var(--input-border); color: var(--input-text); padding: 10px 12px; border-radius: 8px; outline: none; font-size: 13px; font-family: inherit; width: 100%;';
 			const opts = ['<option value="">选择渠道…</option>'].concat(
 				providersCache.map(x => '<option value="' + sen(x.id) + '"' + (x.id === p.providerId ? ' selected' : '') + '>' + sen(x.name) + '</option>')
@@ -11003,8 +10982,12 @@ async function handleAdminPage(request, env, ctx) {
 			const unit = p.unit === 'token' ? 'token' : 'count';
 			return '<div class="quota-member-row" style="display: grid; grid-template-columns: 1.2fr 1.5fr 86px 78px 72px 34px; gap: 8px; align-items: center;">'
 				+ '<select class="quota-m-provider" onchange="syncQuotaRowModels(this)" style="' + inputStyle + '">' + opts + '</select>'
-				+ '<input type="text" class="quota-m-model" list="' + rid + '-models" placeholder="下拉选，或手输" value="' + sen(p.model || '') + '" style="' + inputStyle + '">'
-				+ '<datalist id="' + rid + '-models"></datalist>'
+				// 模型候选用自建下拉（2026-10-09 弃用原生 datalist，同映射页）：
+				// 包一层 .map-combo 作定位容器，面板绝对定位向下展开、盖在右侧几列之上
+				+ '<div class="map-combo" style="min-width: 0;">'
+				+ '<input type="text" class="quota-m-model" placeholder="下拉选，或手输" value="' + sen(p.model || '') + '" style="' + inputStyle + '">'
+				+ '<div class="map-combo-menu"></div>'
+				+ '</div>'
 				+ '<input type="number" class="quota-m-limit" min="0" placeholder="0" value="' + (Number(p.limit) || 0) + '" style="' + inputStyle + '">'
 				+ '<select class="quota-m-unit" style="' + inputStyle + '">'
 				+ '<option value="count"' + (unit === 'count' ? ' selected' : '') + '>次数</option>'
@@ -11018,15 +11001,15 @@ async function handleAdminPage(request, env, ctx) {
 				+ '</div>';
 		}
 
-		// 换了渠道 → 该行的模型候选跟着换（只列这个渠道的模型，避免选到别家的）
+		// 换了渠道 → 该行的模型候选跟着换（只列这个渠道的模型，避免选到别家的）。
+		// 只重填内容、不弹开面板 —— 开合由 focus/input 事件管（2026-10-09 弃用原生 datalist）
 		function syncQuotaRowModels(sel) {
 			const row = sel.closest('.quota-member-row');
 			if (!row) return;
-			const list = row.querySelector('datalist');
-			if (!list) return;
+			const menu = row.querySelector('.map-combo-menu');
+			if (!menu) return;
 			const p = providersCache.find(x => x.id === sel.value);
-			list.innerHTML = ((p && p.models) || [])
-				.map(m => '<option value="' + sen(m) + '"></option>').join('');
+			fillComboMenu(menu, (p && p.models) || [], '', false);
 		}
 
 		// 打开弹窗后把每行的模型候选初始化一遍（编辑已有成员时要还原）
@@ -11375,23 +11358,120 @@ async function handleAdminPage(request, env, ctx) {
 		}
 
 		// 「目标模型」的下拉候选：所有启用渠道的模型 + 内置 CF 预设的值。
-		// 只是加速输入 —— 输入框本身仍可手输任意值（渠道里没填的模型也能临时用）
+		// 只是加速输入 —— 输入框本身仍可手输任意值（渠道里没填的模型也能临时用）。
+		// 2026-10-09：原生 datalist 的弹出面板不受 CSS 控制（字体小、宽度窄、选项截断），
+		// 改自建下拉渲染候选；教训同配额「重置基准」：只向下展开、绝不向上翻。
+		let mapTargetCandidates = [];
 		function refreshMappingTargetOptions() {
-			const list = document.getElementById('map-target-options');
-			if (!list) return;
+			const menu = document.getElementById('map-target-menu');
+			if (!menu) return;
 			const seen = {};
 			const opts = [];
 			const push = (v) => {
 				if (!v || seen[v]) return;
 				seen[v] = true;
-				opts.push('<option value="' + sen(v) + '"></option>');
+				opts.push(v);
 			};
 			providersCache.forEach(p => {
 				if (p.status === 'disabled') return;
 				(p.models || []).forEach(m => push('provider:' + p.name + '/' + m));
 			});
 			Object.keys(defaultMappings).forEach(k => push(defaultMappings[k]));
-			list.innerHTML = opts.join('');
+			mapTargetCandidates = opts;
+			renderMapTargetMenu('');
+		}
+
+		// 渲染候选内容的公共件（映射页 + 配额成员行共用）：
+		// 按关键字小写包含过滤；withOpen=true 时同时按「有无结果」开合面板
+		function fillComboMenu(menu, candidates, kwRaw, withOpen) {
+			const kw = (kwRaw || '').toLowerCase();
+			const items = (candidates || []).filter(v => !kw || String(v).toLowerCase().indexOf(kw) !== -1);
+			menu.innerHTML = items.map(v =>
+				'<button type="button" class="map-combo-item" data-value="' + sen(v) + '" title="' + sen(v) + '">' + sen(v) + '</button>'
+			).join('');
+			if (withOpen) {
+				const combo = menu.closest('.map-combo');
+				if (combo) combo.classList.toggle('open', items.length > 0);
+			}
+		}
+
+		// 按关键字渲染映射页候选面板；关键字为空 = 全量。开合挂在 .map-combo 的 open 类上
+		function renderMapTargetMenu(kwRaw) {
+			const menu = document.getElementById('map-target-menu');
+			if (!menu) return;
+			fillComboMenu(menu, mapTargetCandidates, kwRaw, true);
+		}
+
+		// 配额弹窗成员行的候选：跟着该行选中的渠道走（现查 providersCache，不落变量）
+		function fillQuotaRowMenu(row, kwRaw) {
+			if (!row) return;
+			const menu = row.querySelector('.map-combo-menu');
+			if (!menu) return;
+			const sel = row.querySelector('.quota-m-provider');
+			const p = sel ? providersCache.find(x => x.id === sel.value) : null;
+			fillComboMenu(menu, (p && p.models) || [], kwRaw, true);
+		}
+
+		// 成员行是动态生成的 → 在 #quota-members 上事件委托只挂一次
+		// （focus 给全量列表、input 按关键字过滤、Escape 收起、mousedown 选中）
+		function initQuotaModelCombo() {
+			const box = document.getElementById('quota-members');
+			if (!box) return;
+			box.addEventListener('focusin', (e) => {
+				if (!e.target.closest('.quota-m-model')) return;
+				// 只保留当前这一个：别处还开着的面板全部收掉
+				document.querySelectorAll('.map-combo.open').forEach(el => el.classList.remove('open'));
+				fillQuotaRowMenu(e.target.closest('.quota-member-row'), '');
+			});
+			box.addEventListener('input', (e) => {
+				if (!e.target.closest('.quota-m-model')) return;
+				fillQuotaRowMenu(e.target.closest('.quota-member-row'), e.target.value.trim());
+			});
+			box.addEventListener('keydown', (e) => {
+				if (e.key !== 'Escape') return;
+				const combo = e.target.closest('.map-combo');
+				if (combo) combo.classList.remove('open');
+			});
+			box.addEventListener('mousedown', (e) => {
+				const item = e.target.closest('.map-combo-item');
+				if (!item) return;
+				e.preventDefault(); // mousedown 先于 blur：拦下默认行为，免得面板先被收掉
+				const row = item.closest('.quota-member-row');
+				const input = row ? row.querySelector('.quota-m-model') : null;
+				if (input) input.value = item.dataset.value;
+				item.closest('.map-combo').classList.remove('open');
+			});
+		}
+
+		// 交互接线（只挂一次）：聚焦给全量列表（改值时不被现有值过滤住），输入时按关键字过滤
+		function initMapTargetCombo() {
+			const input = document.getElementById('map-target');
+			const menu = document.getElementById('map-target-menu');
+			if (!input || !menu) return;
+			const combo = menu.closest('.map-combo');
+			input.addEventListener('focus', () => {
+				// 只保留当前这一个：别处还开着的面板收掉（含配额弹窗的行内面板）
+				document.querySelectorAll('.map-combo.open').forEach(el => el.classList.remove('open'));
+				renderMapTargetMenu('');
+			});
+			input.addEventListener('input', () => renderMapTargetMenu(input.value.trim()));
+			menu.addEventListener('mousedown', (e) => {
+				const item = e.target.closest('.map-combo-item');
+				if (!item) return;
+				e.preventDefault(); // mousedown 先于 blur：拦下默认行为，免得面板先被收掉
+				input.value = item.dataset.value;
+				combo.classList.remove('open');
+			});
+			// 点到页面上其他地方：除目标所在的那个外，已打开的下拉全部收起
+			document.addEventListener('click', (e) => {
+				const keep = e.target.closest ? e.target.closest('.map-combo') : null;
+				document.querySelectorAll('.map-combo.open').forEach(el => {
+					if (el !== keep) el.classList.remove('open');
+				});
+			});
+			input.addEventListener('keydown', (e) => {
+				if (e.key === 'Escape') combo.classList.remove('open');
+			});
 		}
 
 		async function loadSettings() {
