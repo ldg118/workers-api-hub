@@ -10,7 +10,7 @@
 // ★★ 硬约定：**每次改动 _worker.js 都要把版本号 +1**（日期变了就换新日期，**序号继续递增、不重置**）。
 //    格式固定 `YYYY-MM-DD.N`。验证脚本会拦下格式不对的值，但「有没有 +1」只能靠自觉 ——
 //    曾经因为版本号没变，本地/线上分不清哪个是哪版，白排查了一整轮。
-const BUILD_ID = '2026-10-09.141';
+const BUILD_ID = '2026-10-10.144';
 
 // 系统默认密钥自动轮换参数
 const ROTATE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000; // 轮换周期：7 天
@@ -660,6 +660,17 @@ function cooldownWorkerExhaustMs(env) {
 	const v = Number(env && env.COOLDOWN_WORKER_EXHAUST_MS);
 	return Number.isFinite(v) && v >= 1000 ? v : QUOTA_COOLDOWN_WORKER_MS;
 }
+// 组级「上游冷却时长」覆盖（2026-10-10）：配额组可以自带 cooldownSec（秒），留空/0 = 用全局默认。
+// 为什么需要它：全局值是**一个数**，而「成员少的组」和「成员多的组」对冷却时长的容忍度正好相反 ——
+//   冷却中的成员会被 pickQuotaMember **直接跳过**，组越小越容易整组同时进冷却（那就是请求直接失败）；
+//   所以小组合该调短、大组合无所谓（这类错误上游是秒回、不产生 token 计费，重试很便宜）。
+// ⚠️ 只覆盖两类「可配置的短冷却」：上游拥塞（worker 池挤满）与 429 限流。
+//    401/403 与 5xx / 超时的 30s **不覆盖**：那两类缩短没有任何好处（key 错了/上游崩了，早试也是白试）。
+// 非法值（负数/非数字）在这里一律当「不覆盖」—— 校验在保存接口做（那里会显式 400）。
+function quotaCoolOverrideMs(group) {
+	const n = Number(group && group.cooldownSec);
+	return Number.isFinite(n) && n >= 1 ? Math.floor(n) * 1000 : 0;
+}
 // 判定上游是否在说「我不认识 stream_options / include_usage」。
 // 只有正文点名了这个字段才做「去掉注入重试一次」，避免对普通 400 盲目重试（白白多打一次上游额度）。
 const USAGE_FIELD_REJECTED_RE = /stream_options|include_usage/i;
@@ -825,9 +836,12 @@ async function clearCooldown(env, providerId, model) {
 // transient = 瞬时基础设施错误（5xx / 超时 / 连不上）→ 值得**原地再试一次**；
 //             429 / 401 / 403 / 402 不算（原地重试没用，得换成员或等冷却）。
 // 冷却时长分两档：瞬时错误 30s / 429 限流 60s；**额度耗尽类 30 分钟**（不会自愈，见常量注释）。
-function classifyUpstreamFailure(result, env) {
+// coolOverrideMs：配额组的组级冷却覆盖（毫秒；0/缺省 = 用全局）。见 quotaCoolOverrideMs。
+//   只作用于「上游拥塞」与「429 限流」两档；retry_after 仍照旧取更长者（上游明确说了等多久，得尊重）。
+function classifyUpstreamFailure(result, env, coolOverrideMs) {
 	const s = Number((result && (result.upstreamStatus || result.status)) || 0);
 	const msg = String((result && result.error) || '');
+	const coolOv = Number(coolOverrideMs) > 0 ? Number(coolOverrideMs) : 0;
 	// ★ 最先判「模型级 worker 池挤满」（2026-10-09，参考 nim-proxy）：
 	//   NIM 除 40 RPM 外还有**每模型 worker 并发上限**，报错正文含 `ResourceExhausted:
 	//   Worker local total request limit reached (32/32)`。若落到下面的 `/resource_exhausted/i`
@@ -837,7 +851,7 @@ function classifyUpstreamFailure(result, env) {
 		return {
 			retryable: true,
 			transient: false,
-			coolMs: cooldownWorkerExhaustMs(env),
+			coolMs: coolOv || cooldownWorkerExhaustMs(env),   // 组里填了就按组的来（见 quotaCoolOverrideMs）
 			reason: '上游模型级并发已满（worker 池挤满，稍后自愈）'
 		};
 	}
@@ -851,7 +865,8 @@ function classifyUpstreamFailure(result, env) {
 	if (s === 402 || (s === 429 && quotaExhausted)) {
 		out = { retryable: true, transient: false, coolMs: QUOTA_COOLDOWN_QUOTA_MS, reason: `上游 ${s}（额度/余额已耗尽）` };
 	}
-	else if (s === 429) out = { retryable: true, transient: false, coolMs: cooldown429Ms(env), reason: '上游 429 限流' };
+	// 429 限流同样吃组级覆盖（RPM 级限流在小组里也会把整组关 60s，正是用户要调短的那类）
+	else if (s === 429) out = { retryable: true, transient: false, coolMs: coolOv || cooldown429Ms(env), reason: '上游 429 限流' };
 	else if (s === 401 || s === 403) out = { retryable: true, transient: false, coolMs: QUOTA_COOLDOWN_ERR_MS, reason: `上游 ${s}（key 无效 / 无权限）` };
 	else if (s >= 500) out = { retryable: true, transient: true, coolMs: QUOTA_COOLDOWN_ERR_MS, reason: `上游 ${s}` };
 	else if (s >= 400) out = { retryable: false, transient: false, coolMs: 0, reason: `上游 ${s}（请求本身有问题，换成员也没用）` };
@@ -2838,6 +2853,11 @@ async function callUpstream(route, payload, env, stream, ctx) {
 	// 上游偶发过载很常见（实测 Google 会间歇性 503），重试一次基本就过。
 	// 总开关关掉时：不换成员、不冷却、也不重试（回到最早的行为）。
 	const sched = await isQuotaSchedulingOn(env);
+	// 组级冷却覆盖：整个请求只读一次组配置（换成员时复用，顺带省掉循环里的重复读取）
+	const groupCfg = route.quotaGroupId
+		? (((await getQuotaGroups(env)) || []).find(x => x.id === route.quotaGroupId) || null)
+		: null;
+	const coolOverride = quotaCoolOverrideMs(groupCfg);
 	const tried = new Set();
 	const switchBudget = (route.quotaGroupId && sched) ? quotaMaxSwitch(env) : 1;
 	const sessionKey = route.quotaGroupId ? sessionKeyOf(payload) : '';
@@ -2855,8 +2875,7 @@ async function callUpstream(route, payload, env, stream, ctx) {
 			// 先试「换成员」
 			let switched = false;
 			if (tries < switchBudget && route.quotaGroupId && sched) {
-				const groups = await getQuotaGroups(env);
-				const g = (groups || []).find(x => x.id === route.quotaGroupId);
+				const g = groupCfg;   // 本请求开头已读过一次，这里复用（同一请求内配置不会变）
 				if (g) {
 					const next = await pickQuotaMember(g, env, { exclude: tried, inflight: inflightByMember, sessionKey, scheduling: sched });
 					const np = next.ok ? providers.find(p => p.id === next.providerId) : null;
@@ -2914,7 +2933,7 @@ async function callUpstream(route, payload, env, stream, ctx) {
 
 		// 失败：先落统计，再判断该不该冷却 / 换下一个 / 原地重试
 		recordProviderCall(env, ctx, curProvider, curModel, false, elapsed, false, 0);
-		lastCls = classifyUpstreamFailure(r, env);
+		lastCls = classifyUpstreamFailure(r, env, coolOverride);
 		if (lastCls.retryable && sched) await setCooldown(env, curProvider.id, curModel, lastCls.coolMs, lastCls.reason);
 		result = r;
 		if (!lastCls.retryable) break; // 400 这类是请求本身的问题，换成员 / 重试都一样
@@ -5461,6 +5480,21 @@ async function handleDashboardApi(request, env, ctx) {
 				return new Response(JSON.stringify({ error: `已有同名的配额组：${name}` }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 			}
 
+			// 组级「上游冷却时长」（秒）：留空/0 = 跟随全局默认（拥塞 20s / 限流 60s）。
+			// 与「上限 / 优先级」同一套规矩：填了非法值就**显式报错**，不静默兜底 —— 否则
+			// 用户以为调短了、实际还在用 20s，正好踩在这功能最要命的场景上（小组成员少）。
+			let cooldownSec = 0;
+			const rawCool = body.cooldownSec;
+			if (rawCool !== undefined && rawCool !== null && rawCool !== '') {
+				const cn = Number(rawCool);
+				if (!Number.isFinite(cn) || cn < 0 || cn > 600) {
+					return new Response(JSON.stringify({
+						error: `上游冷却不是合法的秒数：${JSON.stringify(rawCool)}（留空或 0 表示跟随全局默认，可填 1~600）`
+					}), { status: 400, headers: { 'Content-Type': 'application/json' } });
+				}
+				cooldownSec = Math.floor(cn);
+			}
+
 			// 重置基准：时区预设 + 该时区的本地时刻。老组没有这两个字段 → 落到 UTC 零点，
 			// 行为与改造前一致（零迁移）。
 			const resetTzKey = String(body.resetTz || '');
@@ -5475,6 +5509,8 @@ async function handleDashboardApi(request, env, ctx) {
 				resetDay: Math.max(1, Math.min(31, Math.floor(Number(body.resetDay)) || 1)),
 				// 会话粘性：同一会话尽量固定同一个成员（多轮/工具调用更稳）；默认开（未设置即视为开）
 				sticky: body.sticky !== false,
+				// 组级上游冷却（秒）：0 = 跟随全局默认。老组没有这个字段 → 0，行为与改造前一致（零迁移）
+				cooldownSec,
 				members
 			};
 
@@ -9200,12 +9236,29 @@ async function handleAdminPage(request, env, ctx) {
 			<input type="hidden" id="quota-id-edit">
 
 			<div class="modal-body">
-				<div style="display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px;">
-					<div class="form-group">
-						<label for="quota-name">组名（自定义命名，不能含 / 和前缀 TT:）</label>
-						<input type="text" id="quota-name" placeholder="如: gemini-free" oninput="updateQuotaNamePreview()">
-						<div id="quota-name-call" style="font-size: 11px; color: var(--text-muted); margin-top: 4px; line-height: 1.5;">客户端调用时模型名填 <code id="quota-name-call-code" style="cursor: pointer;" onclick="copyQuotaCallName()" title="点击复制">TT:&lt;组名&gt;</code></div>
-					</div>
+				<!-- 组名独占一行（原来和「重置」三件套挤在一个 2×2 网格里）；
+				     标题直接用那句调用说明，不再另写「组名」二字（2026-10-10 用户要求） -->
+				<div class="form-group">
+					<label for="quota-name" id="quota-name-call">客户端调用时模型名填 <code id="quota-name-call-code" style="cursor: pointer;" onclick="copyQuotaCallName()" title="点击复制">TT:&lt;组名&gt;</code></label>
+					<input type="text" id="quota-name" placeholder="如: gemini-free（不能含 / 和前缀 TT:）" oninput="updateQuotaNamePreview()">
+				</div>
+
+				<!-- ★ 成员区排在「重置周期/时刻/时区」**之前**（2026-10-10 用户要求两块对调）：
+				     弹窗一打开就先看见成员表格，而不是先看一屏说明性字段 -->
+				<div style="display: flex; align-items: center; justify-content: space-between;">
+					<span style="font-size: 13px; color: var(--text-muted);">成员 —— 按消耗比例自动分摊（谁用得少用谁），某个成员报错会自动换下一个</span>
+					<button class="btn btn-secondary" onclick="addQuotaMemberRow()" style="padding: 6px 12px; font-size: 12px;">添加成员</button>
+				</div>
+
+				<div style="display: grid; grid-template-columns: 56px 1.2fr 1.5fr 78px 72px 72px 34px; gap: 8px; font-size: 12px; color: var(--text-muted);">
+					<span title="数字越小越先用；同一层内仍然按负载均衡分摊">优先</span><span>渠道</span><span>上游模型名</span><span>上限</span><span>单位</span><span>状态</span><span></span>
+				</div>
+				<div id="quota-members" style="display: flex; flex-direction: column; gap: 10px;"></div>
+
+				<!-- 重置基准三件套并成一行（组名搬走后不必再占 2×2）；
+				     中间「重置时刻」给固定 200px，好让「重置时刻（该时区的本地时间）」这个长标签不折行
+				     —— 标签一折行，本行三个输入框就不在同一水平线上了 -->
+				<div style="display: grid; grid-template-columns: minmax(0, 1fr) 200px minmax(0, 1fr); gap: 16px;">
 					<div class="form-group">
 						<label for="quota-period">重置周期</label>
 						<div class="quota-combo" id="quota-period-combo">
@@ -9245,16 +9298,6 @@ async function handleAdminPage(request, env, ctx) {
 
 				<div id="quota-reset-preview" style="font-size: 12px; color: var(--text-muted); line-height: 1.6;"></div>
 
-				<div style="display: flex; align-items: center; justify-content: space-between;">
-					<span style="font-size: 13px; color: var(--text-muted);">成员 —— 按消耗比例自动分摊（谁用得少用谁），某个成员报错会自动换下一个</span>
-					<button class="btn btn-secondary" onclick="addQuotaMemberRow()" style="padding: 6px 12px; font-size: 12px;">添加成员</button>
-				</div>
-
-				<div style="display: grid; grid-template-columns: 56px 1.2fr 1.5fr 78px 72px 72px 34px; gap: 8px; font-size: 12px; color: var(--text-muted);">
-					<span title="数字越小越先用；同一层内仍然按负载均衡分摊">优先</span><span>渠道</span><span>上游模型名</span><span>上限</span><span>单位</span><span>状态</span><span></span>
-				</div>
-				<div id="quota-members" style="display: flex; flex-direction: column; gap: 10px;"></div>
-
 				<label style="display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--text-muted); cursor: pointer;">
 					<input type="checkbox" id="quota-status-active" style="width: 16px; height: 16px; padding: 0; margin: 0; flex: none; accent-color: var(--accent-color);">
 					启用这个配额组
@@ -9263,6 +9306,15 @@ async function handleAdminPage(request, env, ctx) {
 					<input type="checkbox" id="quota-sticky" style="width: 16px; height: 16px; padding: 0; margin: 0; flex: none; accent-color: var(--accent-color);">
 					会话粘性（默认开启；同一个会话尽量固定用同一个成员 —— 多轮对话 / 工具调用更稳，代价是分摊略不均）
 				</label>
+
+				<!-- 上游冷却放这里（而不是顶部）：它是「高级/次要」设置，放顶上会把「添加成员」顶到折叠线以下
+				     —— 打开弹窗第一眼看不到正事（2026-10-10 用户反馈） -->
+				<div class="form-group">
+					<label for="quota-cooldown">上游冷却时长（秒）—— 填一个数，拥塞与 429 限流都按它</label>
+					<input type="number" id="quota-cooldown" min="0" max="600" step="1" autocomplete="off"
+						placeholder="留空或 0 = 各自默认（拥塞 20 秒 / 429 限流 60 秒）">
+					<div style="font-size:11px; color: var(--text-muted); line-height: 1.5;">冷却中的成员不参与选号 —— 成员少的组建议调短（如填 5，则两类都 5 秒）。</div>
+				</div>
 
 				<div id="quota-modal-hint" style="font-size: 12px; color: var(--text-muted); line-height: 1.6;"></div>
 			</div>
@@ -11555,6 +11607,8 @@ async function handleAdminPage(request, env, ctx) {
 					+ (g.status === 'disabled' ? '<span class="badge badge-warning">已停用</span>' : '')
 					+ '<span style="font-size:12px; color:var(--text-muted);">' + sen(g.resetLabel || '') + '</span>'
 					+ '<span style="font-size:12px; color:var(--text-muted);">' + memberCount + ' 个成员</span>'
+					// 组级上游冷却非默认时才显示，免得默认组挂一串噪音
+					+ (Number(g.cooldownSec) > 0 ? '<span style="font-size:12px; color:var(--text-muted);" title="组级上游冷却：覆盖「模型池挤满」与「429 限流」两类">冷却 ' + Math.floor(Number(g.cooldownSec)) + 's</span>' : '')
 					+ '<span style="margin-left:auto; display:flex; gap:10px; align-items:center;">'
 					+ '<label class="switch" title="' + (g.status === 'disabled' ? '点击启用' : '点击停用') + '" onclick="event.stopPropagation()">'
 					+ '<input type="checkbox" data-gid="' + sen(g.id) + '"' + (g.status === 'disabled' ? '' : ' checked') + ' onchange="toggleQuotaGroupStatus(this)">'
@@ -11873,6 +11927,8 @@ async function handleAdminPage(request, env, ctx) {
 			updateQuotaNamePreview();
 			document.getElementById('quota-status-active').checked = g ? g.status !== 'disabled' : true;
 			document.getElementById('quota-sticky').checked = !(g && g.sticky === false);
+			// 上游冷却：0/缺省 → 输入框留空（= 跟随全局默认），别回显成 "0" 让人以为设了值
+			document.getElementById('quota-cooldown').value = (g && Number(g.cooldownSec) > 0) ? Math.floor(Number(g.cooldownSec)) : '';
 			document.getElementById('quota-modal-title').innerText = g ? '编辑配额组' : '新建配额组';
 
 			const members = (g && g.members) || [];
@@ -11913,6 +11969,18 @@ async function handleAdminPage(request, env, ctx) {
 			const tz = parseQuotaTzInput(document.getElementById('quota-reset-tz').value);
 			if (!per.ok) { showToast('重置周期请填「每天」或「每月 N 日」（N 为 1-31）', 'warning'); return; }
 			if (!tz.ok) { showToast('基准时区请从建议列表选择，或直接填偏移分钟数（如 480 / -420）', 'warning'); return; }
+			// 上游冷却（秒）：留空 = 跟随全局默认；填了就必须是 0~600 —— 先给即时提示，
+			// 服务端还有一道同样的校验（防绕过界面直接打接口）
+			const coolRaw = document.getElementById('quota-cooldown').value.trim();
+			let cooldownSec = 0;
+			if (coolRaw !== '') {
+				const cn = Number(coolRaw);
+				if (!Number.isFinite(cn) || cn < 0 || cn > 600) {
+					showToast('上游冷却请填 0~600 的秒数（留空或 0 = 跟随全局默认）', 'warning');
+					return;
+				}
+				cooldownSec = Math.floor(cn);
+			}
 			const payload = {
 				name: document.getElementById('quota-name').value.trim(),
 				period: per.period,
@@ -11922,6 +11990,7 @@ async function handleAdminPage(request, env, ctx) {
 				resetLocalTime: document.getElementById('quota-reset-time').value || '00:00',
 				resetTzOffset: tz.resetTz === 'custom' ? (Number(tz.resetTzOffset) || 0) : 0,
 				sticky: document.getElementById('quota-sticky').checked === true,
+				cooldownSec,
 				members: collectQuotaMembers()
 			};
 			const editId = document.getElementById('quota-id-edit').value;
