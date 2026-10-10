@@ -10,7 +10,7 @@
 // ★★ 硬约定：**每次改动 _worker.js 都要把版本号 +1**（日期变了就换新日期，**序号继续递增、不重置**）。
 //    格式固定 `YYYY-MM-DD.N`。验证脚本会拦下格式不对的值，但「有没有 +1」只能靠自觉 ——
 //    曾经因为版本号没变，本地/线上分不清哪个是哪版，白排查了一整轮。
-const BUILD_ID = '2026-10-10.155';
+const BUILD_ID = '2026-10-10.159';
 
 // 系统默认密钥自动轮换参数
 const ROTATE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000; // 轮换周期：7 天
@@ -2000,7 +2000,7 @@ async function queryProviderStats(env, range, includeInactive = false) {
 	const estRate = Number(env && env.THIRD_PARTY_EST_COST_PER_1K) || 0.0005;
 
 	// 单价来源优先级：① 渠道手填单价 → ② 上游 /models 缓存里的真实价（OpenRouter 等）→ ③ 全局粗估 estRate。
-	// 手填价让 Gemini / Agnes 这类上游不公开价格的渠道也能算得比较准。
+	// 手填价让不公开价格的上游（如 Gemini）也能算得比较准。
 	const providersForPricing = await getProviders(env);
 	// 已停用/已删除的渠道不计入看板：删渠道只清映射、不动 stats 表，历史行仍留着；
 	// 这里在查询侧过滤，today/7d/all 一律默认隐藏。审计时传 includeInactive=1 才显示。
@@ -5691,13 +5691,19 @@ async function handleDashboardApi(request, env, ctx) {
 				resetDay: Math.max(1, Math.min(31, Math.floor(Number(body.resetDay)) || 1)),
 				// 会话粘性：同一会话尽量固定同一个成员（多轮/工具调用更稳）；默认开（未设置即视为开）
 				sticky: body.sticky !== false,
-				// 长流直通（2026-10-10）：组内成员走 OpenAI 透传时，流式响应不逐 chunk 读取，
-				// 防免费档 CPU 10ms 掐断超长输出。代价：token 统计记 0（计次/冷却/选号不受影响）。
-				streamFastPass: body.streamFastPass === true,
 				// 组级上游冷却（秒）：0 = 跟随全局默认。老组没有这个字段 → 0，行为与改造前一致（零迁移）
 				cooldownSec,
 				members
 			};
+			// 长流直通（2026-10-10）：组内成员走 OpenAI 透传时，流式响应不逐 chunk 读取，
+			// 防免费档 CPU 10ms 掐断超长输出。代价：token 统计记 0（计次/冷却/选号不受影响）。
+			// ⚠️ undefined 哨兵（与渠道侧同款，2026-10-10）：未提交该字段 = 编辑时保留原值，
+			//    新建时缺省 false —— 未来出现漏带字段的快捷保存路径也不会静默重置这个开关。
+			if (body.streamFastPass === undefined) {
+				if (!body.id) payload.streamFastPass = false;
+			} else {
+				payload.streamFastPass = body.streamFastPass === true;
+			}
 
 			if (body.id) {
 				let found = false;
@@ -9326,7 +9332,7 @@ async function handleAdminPage(request, env, ctx) {
 						<input type="number" id="provider-price-input" step="0.0001" min="0" placeholder="输入价 $/百万 tokens">
 						<input type="number" id="provider-price-output" step="0.0001" min="0" placeholder="输出价 $/百万 tokens">
 					</div>
-					<div class="section-note" style="margin-top: 6px;">留空 = 用上游价（OpenRouter 这类会自动带回）或全局粗估。Gemini / Agnes 这类上游不公开价格，手填后统计看板的「估算成本」更准。两格都填 <b>0</b> = 标记为「免费渠道」，看板成本按 0 计。</div>
+					<div class="section-note" style="margin-top: 6px;">计费优先级：手填 &gt; 上游价 &gt; 全局粗估。留空 = 自动取上游带回的价格或全局粗估（默认 $0.5/百万 tokens）；上游不公开价格的建议手填，看板「估算成本」更准。两格都填 <b>0</b> = 免费渠道，成本按 0 计。</div>
 				</div>
 
 				<div id="provider-test-result" style="display: none;">
@@ -9554,6 +9560,9 @@ async function handleAdminPage(request, env, ctx) {
 		// 注意：必须在 let customMappings 之前声明 —— _verify_mapping_ui.mjs 从那行开始抽代码段，
 		// 而这里是模板内插语法，抽到沙箱里会变成非法 JS。
 		const mappingCostTier = ${JSON.stringify(MODEL_COST_TIER)};
+		// 「估算成本」全局兜底单价（美元/千 token）：与 queryProviderStats 的 estRate 同一个环境变量、
+		// 同一个默认值 —— 账号池概览卡的「成本节省」曾硬编码 0.011 没跟上 2026-10-10 的下调，这里统一注入。
+		const estCostRate = ${JSON.stringify(Number(env && env.THIRD_PARTY_EST_COST_PER_1K) || 0.0005)};
 		let customMappings = {};
 		let mappingInvalid = {};
 		let mappingCfEnabled = true;
@@ -9707,7 +9716,7 @@ async function handleAdminPage(request, env, ctx) {
 			document.getElementById('stat-neurons-progress').style.width = overallPercentage + '%';
 			document.getElementById('stat-neurons-desc').innerText = \`\${roundedTotalUsageToday.toLocaleString()} / \${totalLimit.toLocaleString()} Neurons (\${overallPercentage.toFixed(2)}%)\`;
 			
-			const costSaved = (totalUsageToday / 1000) * 0.011;
+			const costSaved = (totalUsageToday / 1000) * estCostRate;
 			document.getElementById('stat-cost-saving').innerText = '$' + costSaved.toFixed(2);
 
 			const dates = Object.keys(historyData).sort();
