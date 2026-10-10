@@ -10,6 +10,9 @@ _dryrun_*.mjs
 _probe_*.sh
 _verify_*.mjs
 
+# 主目录的手工备份副本（如 "_worker - 副本.js"）
+/_worker - *.js
+
 # 系统/编辑器
 .DS_Store
 Thumbs.db
