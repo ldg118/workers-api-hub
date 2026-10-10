@@ -10,7 +10,7 @@
 // ★★ 硬约定：**每次改动 _worker.js 都要把版本号 +1**（日期变了就换新日期，**序号继续递增、不重置**）。
 //    格式固定 `YYYY-MM-DD.N`。验证脚本会拦下格式不对的值，但「有没有 +1」只能靠自觉 ——
 //    曾经因为版本号没变，本地/线上分不清哪个是哪版，白排查了一整轮。
-const BUILD_ID = '2026-10-10.152';
+const BUILD_ID = '2026-10-10.154';
 
 // 系统默认密钥自动轮换参数
 const ROTATE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000; // 轮换周期：7 天
@@ -596,18 +596,17 @@ function quotaMeterOf(entry, unit) {
 	return unit === 'token' ? (Number(entry.tokens) || 0) : (Number(entry.count) || 0);
 }
 
-// 查一组配额成员的「本周期已用量」。周期边界由组自己的重置时区/时刻决定。
-// 返回 Map<JSON[providerId, model], {count, tokens}>；返回 null 表示算不出来（未绑 D1 / 查询失败）——
-// 调用方必须区分 null 和 0。两种计量一次查出（只多一列、往返次数不变），由成员自己的 unit 决定用哪个。
-async function queryQuotaUsage(env, group, members) {
-	if (!env.DB) return null;
-	await ensureStatsTable(env);
+// 配额成员名单 → 去重后的 id 数组 + 参数化占位符（queryQuotaUsage / queryQuotaHourUsage 共用）。
+function quotaMemberPlaceholders(members) {
 	const ids = [...new Set((members || []).map(m => String(m.providerId)))];
-	if (!ids.length) return new Map();
-	const placeholders = ids.map(() => '?').join(',');
-	const win = quotaWindow(group, Date.now());
-	// 进程内短缓存：同一周期内结果基本不变，5s 陈旧对分流无影响（见 QUOTA_QUERY_CACHE_MS）
-	const cacheKey = 'qusage:' + (group ? group.id : '') + '|' + win.startKey + '|' + win.endKey + '|' + ids.slice().sort().join(',');
+	return { ids, placeholders: ids.map(() => '?').join(',') };
+}
+
+// D1 stats 聚合查询 + isolate 内短缓存的公共骨架（2026-10-10 从 queryQuotaUsage /
+// queryQuotaHourUsage 抽出）：两处只有「时间窗条件」和「缓存 key」不同，其余样板完全一致。
+// 返回 Map<JSON[providerId, model], {count, tokens}>；null = 查询失败（调用方必须区分 null 和 0）。
+// 只缓存成功结果，失败(null)不缓存，避免瞬时故障被放大。
+async function cachedStatsSum(env, cacheKey, sql, bind) {
 	const now = Date.now();
 	const ttl = quotaQueryCacheMs(env);
 	if (ttl > 0) {
@@ -617,6 +616,33 @@ async function queryQuotaUsage(env, group, members) {
 			quotaQueryCache.delete(cacheKey); // 过期项顺手清，避免 Map 无限膨胀
 		}
 	}
+	try {
+		const { results } = await env.DB.prepare(sql).bind(...bind).all();
+		const out = new Map();
+		for (const r of results || []) {
+			out.set(JSON.stringify([String(r.provider_id), String(r.model)]), {
+				count: Number(r.used_count) || 0,
+				tokens: Number(r.used_tokens) || 0
+			});
+		}
+		if (ttl > 0) quotaQueryCache.set(cacheKey, { expiry: now + ttl, value: out });
+		return out;
+	} catch (e) {
+		return null;
+	}
+}
+
+// 查一组配额成员的「本周期已用量」。周期边界由组自己的重置时区/时刻决定。
+// 返回 Map<JSON[providerId, model], {count, tokens}>；返回 null 表示算不出来（未绑 D1 / 查询失败）——
+// 调用方必须区分 null 和 0。两种计量一次查出（只多一列、往返次数不变），由成员自己的 unit 决定用哪个。
+async function queryQuotaUsage(env, group, members) {
+	if (!env.DB) return null;
+	await ensureStatsTable(env);
+	const { ids, placeholders } = quotaMemberPlaceholders(members);
+	if (!ids.length) return new Map();
+	const win = quotaWindow(group, Date.now());
+	// 进程内短缓存：同一周期内结果基本不变，5s 陈旧对分流无影响（见 QUOTA_QUERY_CACHE_MS）
+	const cacheKey = 'qusage:' + (group ? group.id : '') + '|' + win.startKey + '|' + win.endKey + '|' + ids.slice().sort().join(',');
 	// req + probe_req：把「测试连通 / 测模型」这类探测调用也算进配额。
 	// 上游是按总请求数算额度的，测试同样消耗它 —— 不合并的话会出现
 	// 「测试把额度用掉了，配额却还显示有剩余」的假象。
@@ -626,21 +652,7 @@ async function queryQuotaUsage(env, group, members) {
 	   FROM stats
 	   WHERE day >= ? AND day < ? AND provider_id IN (${placeholders})
 	   GROUP BY provider_id, model`;
-	try {
-		const { results } = await env.DB.prepare(sql).bind(win.startKey, win.endKey, ...ids).all();
-		const out = new Map();
-		for (const r of results || []) {
-			out.set(JSON.stringify([String(r.provider_id), String(r.model)]), {
-				count: Number(r.used_count) || 0,
-				tokens: Number(r.used_tokens) || 0
-			});
-		}
-		// 只缓存成功结果，失败(null)不缓存，避免瞬时故障被放大
-		if (ttl > 0) quotaQueryCache.set(cacheKey, { expiry: now + ttl, value: out });
-		return out;
-	} catch (e) {
-		return null;
-	}
+	return cachedStatsSum(env, cacheKey, sql, [win.startKey, win.endKey, ...ids]);
 }
 
 // ---------------- 配额调度基础设施（2026-10-06 新增，参考 sub2api 的账号调度） ----------------
@@ -899,42 +911,19 @@ function classifyUpstreamFailure(result, env, coolOverrideMs) {
 async function queryQuotaHourUsage(env, members) {
 	if (!env.DB) return null;
 	await ensureStatsTable(env);
-	const ids = [...new Set((members || []).map(m => String(m.providerId)))];
+	const { ids, placeholders } = quotaMemberPlaceholders(members);
 	if (!ids.length) return new Map();
-	const placeholders = ids.map(() => '?').join(',');
 	const hourKey = new Date().toISOString().slice(0, 13);
 	// 进程内短缓存：小时桶内数据在 5s 内几乎不变（见 QUOTA_QUERY_CACHE_MS）
 	const cacheKey = 'qhour:' + hourKey + '|' + ids.slice().sort().join(',');
-	const now = Date.now();
-	const ttl = quotaQueryCacheMs(env);
-	if (ttl > 0) {
-		const hit = quotaQueryCache.get(cacheKey);
-		if (hit) {
-			if (now < hit.expiry) return hit.value;
-			quotaQueryCache.delete(cacheKey); // 过期项顺手清，避免 Map 无限膨胀
-		}
-	}
 	const sql = `SELECT provider_id, model,
 	     COALESCE(SUM(req + probe_req), 0) AS used_count,
 	     COALESCE(SUM(tokens), 0) AS used_tokens
 	   FROM stats
 	   WHERE day = ? AND provider_id IN (${placeholders})
 	   GROUP BY provider_id, model`;
-	try {
-		const { results } = await env.DB.prepare(sql).bind(hourKey, ...ids).all();
-		const out = new Map();
-		for (const r of results || []) {
-			out.set(JSON.stringify([String(r.provider_id), String(r.model)]), {
-				count: Number(r.used_count) || 0,
-				tokens: Number(r.used_tokens) || 0
-			});
-		}
-		// 只缓存成功结果，失败(null)不缓存，避免瞬时故障被放大
-		if (ttl > 0) quotaQueryCache.set(cacheKey, { expiry: now + ttl, value: out });
-		return out;
-	} catch (e) {
-		return null; // 算不出来就退化成不带小时维度，别让选号整个挂掉
-	}
+	// 算不出来（null）就退化成不带小时维度，别让选号整个挂掉
+	return cachedStatsSum(env, cacheKey, sql, [hourKey, ...ids]);
 }
 
 // FNV-1a：会话散列（稳定的确定性哈希，用来做「会话粘性」选号）
@@ -1910,8 +1899,9 @@ function usageOf(result) {
 }
 
 // 流式响应探针：只旁路观察，**不改动任何字节**。
-// 上游（OpenAI 透传 / Gemini 原生适配层）产出的都是标准 OpenAI chunk，
-// 末尾的 usage 块里有 total_tokens；流结束时回调一次，用来补记 token 统计。
+// 上游产出的都是标准 OpenAI chunk，末尾的 usage 块里有 total_tokens；流结束时回调一次，用来补记 token 统计。
+// ⚠️ Opt3（2026-10-10）后本函数只服务「需要在 worker 内转协议」的流（Anthropic 转换路径）——
+//   OpenAI 纯透传流的 token 抽取已融合进 passthroughStream（省一整层 decode/encode），别在这里包。
 function withUsageTap(stream, onUsage) {
 	const reader = stream.getReader();
 	const decoder = new TextDecoder();
@@ -2707,7 +2697,8 @@ async function callProvider(provider, payload, stream, env) {
 
 		// OpenAI 系默认不在流里回 usage，导致 Anthropic 客户端侧 message_delta.usage 恒为 0、
 		// 本代理的流式 token 统计也拿不到。显式请求 include_usage，上游在最后一条 chunk 带 usage，
-		// 由 withUsageTap 捕获补记统计、anthropicStreamTransform 转成 Anthropic 的 usage 事件。
+		// 由 callUpstream 挂到 result.usageTapFn 的回调补记统计（透传路径融合进 passthroughStream、
+		// Anthropic 转换路径仍包 withUsageTap）、anthropicStreamTransform 转成 Anthropic 的 usage 事件。
 		// ⚠️ 但有些端点根本不认这个字段、会整条 4xx 拒掉 → 那个模型的流式从此永远失败。
 		// 故先查「不再注入」名单：被拒过的 (渠道|模型) 直接不注入（见 markUsageInjectDisabled）。
 		// 统一延迟口径：拿到响应头即测 TTFB（首字节），流式/非流式都记这个值
@@ -4444,13 +4435,12 @@ function warmProviderSpecs(provider, ctx) {
 }
 
 
-// 透传 CF /ai/v1/chat/completions 返回的 SSE 流
-// CF 返回的本来就是标准 OpenAI 的 SSE 格式，我们只把模型名改一下，
-// 这样 tool_calls、finish_reason、reasoning_content、usage 等字段都能原样保留。
 // SSE 心跳包装：在「已经开始输出、但下游暂时没有新数据」的空档里，
 // 周期性往外发一个 SSE 注释帧（":" 开头，规范要求客户端忽略），
 // 让 Cloudflare 边缘始终能看到数据在流动，避免长请求被判定为「响应不完整」而回 502。
 // 一旦内层结束（done）或出错，就停止心跳并如实结束/抛出，不吞掉真实错误。
+// ⚠️ Opt3（2026-10-10）后 OpenAI 透传路径的心跳已内联进 passthroughStream，本函数只服务
+//   Anthropic 转换路径（handleMessages）。
 function withSseHeartbeat(innerStream, intervalMs = SSE_HEARTBEAT_MS) {
 	const reader = innerStream.getReader();
 	const encoder = new TextEncoder();
@@ -5378,8 +5368,13 @@ async function handleDashboardApi(request, env, ctx) {
 			// 渠道自定义单价（美元 / 百万 tokens）；undefined = 未提交、null = 清空、对象 = 设置
 			const pricing = sanitizeProviderPricing(body.pricing);
 			// 长流直通（2026-10-10）：流式响应不做逐 chunk 读取，防免费档 CPU 10ms 掐断超长输出。
-			// 代价：流内 model 不回写、token 统计记 0（计次统计不受影响）。勾选 = true，未勾 = false。
-			const fastPassFlag = body.streamFastPass === true;
+			// 代价：流内 model 不回写、token 统计记 0（计次统计不受影响）。
+			// ⚠️ undefined 哨兵：未提交该字段 = 保留原值 —— 编辑弹窗之外的快捷保存路径（如
+			//    saveProviderModels 换名/删模型）漏带字段时，不能把开关静默重置（geminiNative 同款教训）。
+			//    显式 true/false 才覆盖；新建渠道缺省 false。
+			const fastPassFlag = body.streamFastPass === undefined
+				? undefined
+				: body.streamFastPass === true;
 			// Gemini 原生协议开关：true = 强制走原生 / false = 强制走旧兼容端点 / 其它(含未传) = 按 baseUrl 自动判断。
 			// 用 undefined 表示「自动」—— saveProviders 走 JSON，undefined 的键会被丢掉，所以老配置零迁移。
 			const gnFlag = geminiNative === true ? true : (geminiNative === false ? false : undefined);
@@ -5407,7 +5402,7 @@ async function handleDashboardApi(request, env, ctx) {
 					const nextHealth = p.modelHealth
 						? Object.fromEntries(Object.entries(p.modelHealth).filter(([k]) => modelList.includes(k)))
 						: p.modelHealth;
-					return {
+					const next = {
 						...p,
 						name,
 						baseUrl: String(baseUrl).replace(/\/+$/, ''),
@@ -5415,15 +5410,17 @@ async function handleDashboardApi(request, env, ctx) {
 						models: modelList,
 					status: status || p.status || 'active',
 					geminiNative: gnFlag,
-					streamFastPass: fastPassFlag,
 					modelHealth: nextHealth
 					};
+					// 直通开关：undefined（本次未提交）= 保留原值；显式 true/false 才覆盖
+					if (fastPassFlag !== undefined) next.streamFastPass = fastPassFlag;
+					return next;
 				});
 				if (!found) {
 					return new Response(JSON.stringify({ error: 'Provider not found' }), { status: 404 });
 				}
 			} else {
-				providers.push({
+				const created = {
 					id: crypto.randomUUID(),
 					name,
 					type: 'openai',
@@ -5432,9 +5429,11 @@ async function handleDashboardApi(request, env, ctx) {
 					models: modelList,
 				status: status || 'active',
 				geminiNative: gnFlag,
-				streamFastPass: fastPassFlag,
 					createdAt: new Date().toISOString()
-				});
+				};
+				// 新建渠道：未提交该字段 = 缺省 false
+				if (fastPassFlag !== undefined) created.streamFastPass = fastPassFlag;
+				providers.push(created);
 			}
 
 			// 渠道自定义单价：undefined = 本次未提交（保留原值）；null = 显式清空；对象 = 设置。
