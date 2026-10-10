@@ -10,7 +10,7 @@
 // ★★ 硬约定：**每次改动 _worker.js 都要把版本号 +1**（日期变了就换新日期，**序号继续递增、不重置**）。
 //    格式固定 `YYYY-MM-DD.N`。验证脚本会拦下格式不对的值，但「有没有 +1」只能靠自觉 ——
 //    曾经因为版本号没变，本地/线上分不清哪个是哪版，白排查了一整轮。
-const BUILD_ID = '2026-10-10.154';
+const BUILD_ID = '2026-10-10.155';
 
 // 系统默认密钥自动轮换参数
 const ROTATE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000; // 轮换周期：7 天
@@ -12842,14 +12842,16 @@ async function handleAdminPage(request, env, ctx) {
 	return new Response(html, { headers: htmlCacheHeaders(pageEtag) });
 }
 
-// 3. KV 未绑定时的报错页面
-function handleKVError(request) {
+// 3. 配置类错误页（KV 未绑定 / 管理员密码未配置共用一套模板，2026-10-10 合并：
+//    原先两份 ~160 行 HTML 只有标题/文案/图标不同，改一次样式要改两处）。
+// /v1/ 与 /api/ 路径返回 JSON 错误（客户端能解析），其余路径返回本页面。
+function configErrorPage(request, opts) {
 	const html = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 	<meta charset="UTF-8">
 	<meta name="viewport" content="width=device-width, initial-scale=1.0">
-	<title>KV 绑定异常 - Workers API Hub</title>
+	<title>${opts.title} - Workers API Hub</title>
 	${FAVICON_LINK}
 	<link rel="preconnect" href="https://fonts.googleapis.com">
 	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -12992,19 +12994,15 @@ function handleKVError(request) {
 		<div class="bg-orb bg-orb-2"></div>
 	</div>
 	<div class="error-card">
-		<div style="font-size: 48px; margin-bottom: 16px;">⚠️</div>
-		<h1>KV 命名空间未绑定</h1>
-		<p>系统检测到您未在 Cloudflare 平台中为该项目绑定 KV 命名空间，或者绑定的变量名称不为 <strong>KV</strong>。这会导致数据无法保存，系统无法正常运行。</p>
-		
+		<div style="font-size: 48px; margin-bottom: 16px;">${opts.emoji}</div>
+		<h1>${opts.heading}</h1>
+		<p>${opts.message}</p>
+
 		<div class="code-block">
 			<strong>解决方案：</strong><br>
-			1. 进入您的 Cloudflare Workers/Pages 仪表盘。<br>
-			2. 导航至 Settings -> Functions (或 Settings -> Variables) -> KV namespace bindings。<br>
-			3. 添加绑定，将【变量名称 (Variable name)】设置为: <strong>KV</strong><br>
-			4. 保存并重新部署项目即可。
+			${opts.steps}
 		</div>
-		
-		<a href="https://developers.cloudflare.com/kv/learning/kv-bindings/" target="_blank" class="btn">查看官方绑定教程</a>
+		${opts.docLink ? '<a href="' + opts.docLink + '" target="_blank" class="btn">查看官方绑定教程</a>' : ''}
 	</div>
 </body>
 </html>`;
@@ -13012,11 +13010,8 @@ function handleKVError(request) {
 	const url = new URL(request.url);
 	if (url.pathname.startsWith('/v1/') || url.pathname.startsWith('/api/')) {
 		return new Response(JSON.stringify({
-			error: {
-				message: "Cloudflare KV namespace binding 'KV' is missing. Please bind a KV namespace to 'KV' in your Worker/Pages settings.",
-				type: "server_error"
-			}
-		}), { status: 500, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
+			error: { message: opts.apiMessage, type: "server_error" }
+		}), { status: 500, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key' } });
 	}
 
 	return new Response(html, {
@@ -13024,163 +13019,27 @@ function handleKVError(request) {
 	});
 }
 
-// 4. Password Error UI Page
+// 3a. KV 未绑定：数据无处可存，系统无法运行
+function handleKVError(request) {
+	return configErrorPage(request, {
+		title: 'KV 绑定异常',
+		emoji: '⚠️',
+		heading: 'KV 命名空间未绑定',
+		message: '系统检测到您未在 Cloudflare 平台中为该项目绑定 KV 命名空间，或者绑定的变量名称不为 <strong>KV</strong>。这会导致数据无法保存，系统无法正常运行。',
+		steps: '1. 进入您的 Cloudflare Workers/Pages 仪表盘。<br>2. 导航至 Settings -> Functions (或 Settings -> Variables) -> KV namespace bindings。<br>3. 添加绑定，将【变量名称 (Variable name)】设置为: <strong>KV</strong><br>4. 保存并重新部署项目即可。',
+		docLink: 'https://developers.cloudflare.com/kv/learning/kv-bindings/',
+		apiMessage: "Cloudflare KV namespace binding 'KV' is missing. Please bind a KV namespace to 'KV' in your Worker/Pages settings."
+	});
+}
+
+// 3b. 管理员密码未配置：拦截所有访问直到密码配置完成
 function handlePasswordError(request) {
-	const html = `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-	<meta charset="UTF-8">
-	<meta name="viewport" content="width=device-width, initial-scale=1.0">
-	<title>管理员密码未配置 - Workers API Hub</title>
-	${FAVICON_LINK}
-	<link rel="preconnect" href="https://fonts.googleapis.com">
-	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-	<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500&family=Outfit:wght@500;600;700&display=swap" rel="stylesheet">
-	<style>
-		:root {
-			--bg-color: #0b0f19;
-			--card-bg: rgba(30, 41, 59, 0.45);
-			--border-color: rgba(239, 68, 68, 0.2);
-			--text-main: #f8fafc;
-			--text-muted: #94a3b8;
-			--primary-gradient: linear-gradient(135deg, #ef4444 0%, #ec4899 100%);
-			--accent-color: #ec4899;
-			--glass-blur: 20px;
-			--card-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
-			--orb-1-color: rgba(239, 68, 68, 0.08);
-			--orb-2-color: rgba(236, 72, 153, 0.06);
-		}
-
-		${COMMON_CSS_RESET}
-
-		body {
-			font-family: 'Inter', sans-serif;
-			background-color: var(--bg-color);
-			color: var(--text-main);
-			min-height: 100vh;
-			display: flex;
-			align-items: center;
-			justify-content: center;
-			padding: 20px;
-			position: relative;
-			overflow: hidden;
-		}
-
-		/* Dynamic Background Orbs */
-		.bg-orbs-container {
-			position: fixed;
-			top: 0;
-			left: 0;
-			width: 100%;
-			height: 100%;
-			z-index: -1;
-			overflow: hidden;
-			pointer-events: none;
-		}
-
-		.bg-orb {
-			position: absolute;
-			border-radius: 50%;
-			filter: blur(100px);
-			animation: float 25s infinite alternate ease-in-out;
-		}
-
-		.bg-orb-1 {
-			top: -10%;
-			left: -10%;
-			width: 50vw;
-			height: 50vw;
-			background: var(--orb-1-color);
-		}
-
-		.bg-orb-2 {
-			bottom: -10%;
-			right: -10%;
-			width: 60vw;
-			height: 60vw;
-			background: var(--orb-2-color);
-		}
-
-		@keyframes float {
-			0% { transform: translate(0, 0) scale(1); }
-			100% { transform: translate(5%, 5%) scale(1.05); }
-		}
-
-		.error-card {
-			background-color: var(--card-bg);
-			border: 1px solid var(--border-color);
-			border-radius: 20px;
-			padding: 40px;
-			max-width: 500px;
-			width: 100%;
-			text-align: center;
-			box-shadow: var(--card-shadow);
-			backdrop-filter: blur(var(--glass-blur));
-			-webkit-backdrop-filter: blur(var(--glass-blur));
-			z-index: 10;
-		}
-
-		h1 {
-			font-family: 'Outfit', sans-serif;
-			font-size: 24px;
-			color: #ef4444;
-			margin-bottom: 16px;
-			font-weight: 600;
-		}
-
-		p {
-			color: var(--text-muted);
-			font-size: 15px;
-			line-height: 1.6;
-			margin-bottom: 24px;
-		}
-
-		.code-block {
-			background-color: rgba(0, 0, 0, 0.25);
-			padding: 20px;
-			border-radius: 12px;
-			font-family: monospace;
-			font-size: 13px;
-			color: #e9d5ff;
-			text-align: left;
-			margin-bottom: 26px;
-			border: 1px solid rgba(255, 255, 255, 0.05);
-			line-height: 1.8;
-		}
-	</style>
-</head>
-<body>
-	<div class="bg-orbs-container">
-		<div class="bg-orb bg-orb-1"></div>
-		<div class="bg-orb bg-orb-2"></div>
-	</div>
-	<div class="error-card">
-		<div style="font-size: 48px; margin-bottom: 16px;">🔑</div>
-		<h1>管理员密码未配置</h1>
-		<p>系统检测到您未在 Cloudflare 平台中为该项目配置 <strong>ADMIN_PASSWORD</strong> 环境变量。为了您的接口 and 管理后台安全，系统已拦截所有访问，直到密码配置完成。</p>
-		
-		<div class="code-block">
-			<strong>解决方案：</strong><br>
-			1. 进入您的 Cloudflare Workers/Pages 仪表盘。<br>
-			2. 导航至 Settings -> Variables (或 Settings -> Environment Variables)。<br>
-			3. 点击【Add variable】，将【Variable name】设置为: <strong>ADMIN_PASSWORD</strong><br>
-			4. 输入您的管理员登录密码作为其值，保存并部署即可。
-		</div>
-	</div>
-</body>
-</html>`;
-
-	const url = new URL(request.url);
-	if (url.pathname.startsWith('/v1/') || url.pathname.startsWith('/api/')) {
-		return new Response(JSON.stringify({
-			error: {
-				message: "ADMIN_PASSWORD environment variable is missing. Please add the ADMIN_PASSWORD variable to your Worker/Pages settings.",
-				type: "server_error"
-			}
-		}), { status: 500, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key' } });
-	}
-
-	return new Response(html, {
-		headers: { 'Content-Type': 'text/html; charset=utf-8' }
+	return configErrorPage(request, {
+		title: '管理员密码未配置',
+		emoji: '🔑',
+		heading: '管理员密码未配置',
+		message: '系统检测到您未在 Cloudflare 平台中为该项目配置 <strong>ADMIN_PASSWORD</strong> 环境变量。为了您的接口和管理后台安全，系统已拦截所有访问，直到密码配置完成。',
+		steps: '1. 进入您的 Cloudflare Workers/Pages 仪表盘。<br>2. 导航至 Settings -> Variables (或 Settings -> Environment Variables)。<br>3. 点击【Add variable】，将【Variable name】设置为: <strong>ADMIN_PASSWORD</strong><br>4. 输入您的管理员登录密码作为其值，保存并部署即可。',
+		apiMessage: "ADMIN_PASSWORD environment variable is missing. Please add the ADMIN_PASSWORD variable to your Worker/Pages settings."
 	});
 }
