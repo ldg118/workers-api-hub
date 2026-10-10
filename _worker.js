@@ -10,7 +10,7 @@
 // ★★ 硬约定：**每次改动 _worker.js 都要把版本号 +1**（日期变了就换新日期，**序号继续递增、不重置**）。
 //    格式固定 `YYYY-MM-DD.N`。验证脚本会拦下格式不对的值，但「有没有 +1」只能靠自觉 ——
 //    曾经因为版本号没变，本地/线上分不清哪个是哪版，白排查了一整轮。
-const BUILD_ID = '2026-10-10.151';
+const BUILD_ID = '2026-10-10.152';
 
 // 系统默认密钥自动轮换参数
 const ROTATE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000; // 轮换周期：7 天
@@ -231,6 +231,10 @@ const DEFAULT_CONFIG = {
 	hiddenModels: [],
 	// 逐条模型映射的独立开关：这里存的是「已停用」的映射源名（不删映射本身，随时可再打开）
 	disabledMappings: [],
+	// 长流直通的映射名单（2026-10-10）：映射是「单线路直走」的专属通道，这里的源名请求走直通
+	// （不逐 chunk 读流，防免费档 CPU 10ms 掐断超长输出；代价：流内 model 不回写、token 统计记 0）。
+	// 与渠道级 / 配额组级开关是「或」的关系，任一命中即生效。
+	fastPassMappings: [],
 	// 「不要注入 stream_options」的 (渠道|上游模型) 名单：某些端点会因不认识该字段而整条 4xx。
 	// 首次被拒后自动记入，之后对该模型不再注入（参考 nim-proxy 的做法）。
 	noUsageInject: []
@@ -259,6 +263,8 @@ async function getAppConfig(env) {
 				hiddenModels: Array.isArray(data.hiddenModels) ? data.hiddenModels : [],
 				// 已停用的模型映射源名（逐条开关）；老配置缺省 = 全部启用（零迁移）
 				disabledMappings: Array.isArray(data.disabledMappings) ? data.disabledMappings : [],
+				// 长流直通的映射名单；老配置缺省 = 空（零迁移）
+				fastPassMappings: Array.isArray(data.fastPassMappings) ? data.fastPassMappings : [],
 				// 不注入 stream_options 的 (渠道|模型) 名单；老配置缺省 = 空（全部照常注入）
 				noUsageInject: Array.isArray(data.noUsageInject) ? data.noUsageInject : [],
 				// 未显式设置过时：有 CF 账号就沿用「开启」（不静默改变现有部署的行为），
@@ -2950,13 +2956,16 @@ async function callUpstream(route, payload, env, stream, ctx) {
 			// 延迟统一记 TTFB（首字节），流式/非流式口径一致（见 callProvider/callGeminiNative/callAccountPool）
 			const okMs = (r.ttfb != null) ? r.ttfb : elapsed;
 			if (stream && r.stream) {
-				// 长流直通（2026-10-10）：上游原始透传流 + 渠道/配额组勾了 streamFastPass →
+				// 长流直通（2026-10-10）：上游原始透传流 + 渠道/配额组/映射任一勾了 streamFastPass →
 				// 交给响应层原生直管（JS 不逐 chunk 读），免费档 CPU 10ms 下超长输出不再被掐。
 				// 代价：流内 model 不回写、token 统计没有（计次在这里立即落库；冷却/选号都在
 				// 流开始前已完成，不受影响）。Gemini 原生 / CF 账号池的流在 worker 内转换，不适用。
+				// 映射名单的 key 是客户端请求的原始模型名（= 映射源名，单线路直走的专属通道）。
+				const fpCfg = await getAppConfig(env);
 				const fastPass = r.passthrough === true && (
 					(groupCfg && groupCfg.streamFastPass === true) ||
-					(curProvider && curProvider.streamFastPass === true)
+					(curProvider && curProvider.streamFastPass === true) ||
+					(Array.isArray(fpCfg.fastPassMappings) && fpCfg.fastPassMappings.indexOf(payload.model) !== -1)
 				);
 				if (fastPass) {
 					recordProviderCall(env, ctx, curProvider, curModel, true, okMs, false, 0, 0, 0, 0);
@@ -5182,7 +5191,9 @@ async function handleDashboardApi(request, env, ctx) {
 				invalid,
 				cfPoolEnabled: cfEnabled,
 				// 逐条映射开关（已停用的源名），界面据此渲染每行的小开关
-				disabledMappings: Array.isArray(config.disabledMappings) ? config.disabledMappings : []
+				disabledMappings: Array.isArray(config.disabledMappings) ? config.disabledMappings : [],
+				// 长流直通的映射名单（界面据此渲染每行的「直通」开关）
+				fastPassMappings: Array.isArray(config.fastPassMappings) ? config.fastPassMappings : []
 			}), { headers: { 'Content-Type': 'application/json' } });
 		}
 
@@ -5213,14 +5224,17 @@ async function handleDashboardApi(request, env, ctx) {
 
 			await saveCustomModelMap(env, normalized);
 
-			// 顺带清掉「已停用」名单里已不存在的源名（删映射 / 改名后别留孤儿开关状态）。
-			// 注意：**不动**仍然存在的映射的开关状态 —— 用户停用的那些保存后应保持停用。
+			// 顺带清掉「已停用 / 直通」名单里已不存在的源名（删映射 / 改名后别留孤儿开关状态）。
+			// 注意：**不动**仍然存在的映射的开关状态 —— 用户停用/勾直通的那些保存后应保持原样。
 			{
 				const cfg2 = await getAppConfig(env);
-				const prev = Array.isArray(cfg2.disabledMappings) ? cfg2.disabledMappings : [];
-				const pruned = prev.filter(s => Object.prototype.hasOwnProperty.call(normalized, s));
-				if (pruned.length !== prev.length) {
-					cfg2.disabledMappings = pruned;
+				const prevOff = Array.isArray(cfg2.disabledMappings) ? cfg2.disabledMappings : [];
+				const prunedOff = prevOff.filter(s => Object.prototype.hasOwnProperty.call(normalized, s));
+				const prevFp = Array.isArray(cfg2.fastPassMappings) ? cfg2.fastPassMappings : [];
+				const prunedFp = prevFp.filter(s => Object.prototype.hasOwnProperty.call(normalized, s));
+				if (prunedOff.length !== prevOff.length || prunedFp.length !== prevFp.length) {
+					cfg2.disabledMappings = prunedOff;
+					cfg2.fastPassMappings = prunedFp;
 					await saveAppConfig(env, cfg2);
 				}
 			}
@@ -5249,6 +5263,24 @@ async function handleDashboardApi(request, env, ctx) {
 		config.disabledMappings = [...set];
 		await saveAppConfig(env, config);
 		return new Response(JSON.stringify({ success: true, disabledMappings: config.disabledMappings }),
+			{ headers: { 'Content-Type': 'application/json' } });
+	}
+
+	// 10b. 单条映射的「长流直通」开关（2026-10-10）。映射是单线路专属通道，勾上后该源名的
+	//      流式请求不逐 chunk 读取（防免费档 CPU 掐超长输出）。与渠道级 / 组级开关「或」的关系。
+	if (url.pathname === '/api/mappings/fastpass' && method === 'POST') {
+		const body = await request.json().catch(() => ({}));
+		const source = String(body.source || '').trim();
+		if (!source) {
+			return new Response(JSON.stringify({ error: 'source is required' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+		}
+		const enabled = body.enabled !== false;
+		const config = await getAppConfig(env);
+		const set = new Set(Array.isArray(config.fastPassMappings) ? config.fastPassMappings.map(String) : []);
+		if (enabled) set.add(source); else set.delete(source);
+		config.fastPassMappings = [...set];
+		await saveAppConfig(env, config);
+		return new Response(JSON.stringify({ success: true, fastPassMappings: config.fastPassMappings }),
 			{ headers: { 'Content-Type': 'application/json' } });
 	}
 
@@ -9528,6 +9560,8 @@ async function handleAdminPage(request, env, ctx) {
 		let mappingCfEnabled = true;
 		// 逐条映射开关：已停用的源名集合（loadSettings 从 /api/settings 拿）
 		let disabledMappings = new Set();
+		// 长流直通的映射源名集合（loadSettings 从 /api/settings 拿）
+		let fastPassMappings = new Set();
 		// 分组折叠状态：cf=null 表示首次加载还没初始化（loadSettings 里按当前模式决定默认是否折叠，
 		// 之后尊重用户手动展开）；provider 组默认收起。
 		// 模型映射的两个分组（CF / 第三方渠道）**默认全部折叠**（2026-10-09 用户要求）。
@@ -12517,6 +12551,7 @@ async function handleAdminPage(request, env, ctx) {
 				mappingInvalid = data.invalid || {};
 				mappingCfEnabled = data.cfPoolEnabled !== false;
 				disabledMappings = new Set(Array.isArray(data.disabledMappings) ? data.disabledMappings : []);
+				fastPassMappings = new Set(Array.isArray(data.fastPassMappings) ? data.fastPassMappings : []);
 				refreshMappingTargetOptions();
 				renderMappings();
 			} catch (e) {
@@ -12553,9 +12588,12 @@ async function handleAdminPage(request, env, ctx) {
 			const problem = mappingInvalid[source];
 			// 逐条开关：被停用的行整行变淡 + 标红「已停用」，开关关掉
 			const off = disabledMappings.has(source);
+			// 长流直通：勾了 = 该源名的流式请求不逐 chunk 读（防免费档 CPU 掐超长输出）
+			const fp = fastPassMappings.has(source);
 			const isPreset = Object.prototype.hasOwnProperty.call(defaultMappings, source) && defaultMappings[source] === target;
 			const typeText = (isPreset ? '<span class="badge badge-success">预设映射</span>' : '<span class="badge badge-warning">自定义</span>')
 				+ (off ? ' <span class="badge badge-danger">已停用</span>' : '')
+				+ (fp ? ' <span class="badge badge-success" title="长流直通：流式响应不逐 chunk 读取，防超长输出被 CF CPU 限制掐断；流内 model 不回写、token 统计记 0">直通</span>' : '')
 				+ (problem ? ' <span class="badge badge-danger">未生效</span>' : '')
 				+ (problem ? '<div style="color: var(--danger-color); font-size:11.5px; margin-top:5px; max-width:220px; white-space:normal; line-height:1.5;">' + sen(problem) + '</div>' : '');
 			return '<tr' + (off ? ' style="opacity:.55;"' : '') + '>'
@@ -12563,6 +12601,10 @@ async function handleAdminPage(request, env, ctx) {
 				+ '<td><code style="cursor:pointer; word-break:break-all;" title="点击复制" data-copy="' + sen(target) + '" onclick="copyModelId(this.dataset.copy)">' + sen(target) + '</code>' + costTierBadge(target) + '</td>'
 				+ '<td>' + typeText + '</td>'
 				+ '<td style="white-space:nowrap;">'
+				+ '<label class="switch" title="' + (fp ? '点击关闭长流直通' : '点击开启长流直通（防超长输出被 CF 掐断）') + '" style="vertical-align:middle; margin-right:10px;">'
+				+ '<input type="checkbox" data-fpsrc="' + sen(source) + '"' + (fp ? ' checked' : '') + ' onchange="toggleMappingFastPass(this)">'
+				+ '<span class="switch-track"></span>'
+				+ '</label>'
 				+ '<label class="switch" title="' + (off ? '点击启用这条映射' : '点击停用这条映射') + '" style="vertical-align:middle;">'
 				+ '<input type="checkbox" data-src="' + sen(source) + '"' + (off ? '' : ' checked') + ' onchange="toggleMappingStatus(this)">'
 				+ '<span class="switch-track"></span>'
@@ -12689,6 +12731,20 @@ async function handleAdminPage(request, env, ctx) {
 			});
 			if (!res.ok) { showToast('切换失败', 'error'); loadSettings(); return; }
 			showToast(cb.checked ? '已启用该映射' : '已停用该映射');
+			loadSettings();
+		}
+
+		// 单条映射的「长流直通」开关（2026-10-10）：只改 config.fastPassMappings，不删映射。
+		async function toggleMappingFastPass(cb) {
+			const source = cb.dataset.fpsrc;
+			if (!source) return;
+			const res = await apiFetch('/api/mappings/fastpass', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ source, enabled: cb.checked })
+			});
+			if (!res.ok) { showToast('切换失败', 'error'); loadSettings(); return; }
+			showToast(cb.checked ? '已开启该映射的长流直通' : '已关闭该映射的长流直通');
 			loadSettings();
 		}
 
