@@ -10,7 +10,7 @@
 // ★★ 硬约定：**每次改动 _worker.js 都要把版本号 +1**（日期变了就换新日期，**序号继续递增、不重置**）。
 //    格式固定 `YYYY-MM-DD.N`。验证脚本会拦下格式不对的值，但「有没有 +1」只能靠自觉 ——
 //    曾经因为版本号没变，本地/线上分不清哪个是哪版，白排查了一整轮。
-const BUILD_ID = '2026-10-10.144';
+const BUILD_ID = '2026-10-10.151';
 
 // 系统默认密钥自动轮换参数
 const ROTATE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000; // 轮换周期：7 天
@@ -56,7 +56,13 @@ async function fetchWithTtfb(url, init = {}) {
 	const timeoutCtl = new AbortController();
 	const ttfbTimer = setTimeout(() => timeoutCtl.abort(), PROVIDER_TIMEOUT_MS);
 	try {
-		const response = await fetch(url, { ...init, signal: timeoutCtl.signal });
+		// 强制上游不压缩（2026-10-10，Opt3 系列）：Workers 运行时对上游 gzip/br 响应的**逐 chunk 解压
+		// CPU 记在 worker 头上** —— 免费档 10ms 下这正是长流杀手：实测推理模型 6k 个 300B 小 chunk
+		// 累计 ~2000ms CPU 被 exceededResources 杀掉，而大块少 chunk 的流（Gemini）没事。
+		// 关掉压缩后运行时零解压；上游→CF 是机房间直连，多传的原始字节可忽略。
+		// （个别上游无视 identity 仍回 gzip 时，行为与从前相同，不会更差。）
+		const headers = { ...(init.headers || {}), 'Accept-Encoding': 'identity' };
+		const response = await fetch(url, { ...init, headers, signal: timeoutCtl.signal });
 		clearTimeout(ttfbTimer);
 		return { response, ttfb: Date.now() - startedAt };
 	} catch (e) {
@@ -1581,9 +1587,15 @@ async function handleV1Proxy(request, env, ctx) {
 				if (spec.pricing && typeof spec.pricing === 'object') out.pricing = spec.pricing;
 			}
 			if (!out.pricing && provider && provider.pricing) {
-				const prompt = (Number(provider.pricing.inputPer1M) || 0) / 1000000;
-				const completion = (Number(provider.pricing.outputPer1M) || 0) / 1000000;
-				if (prompt || completion) out.pricing = { prompt, completion };
+				const pin = Number(provider.pricing.inputPer1M);
+				const pout = Number(provider.pricing.outputPer1M);
+				// 显式 0/0（免费渠道）也是合法定价，应透出（prompt/completion = 0），不能靠真值短路漏掉。
+				if (Number.isFinite(pin) || Number.isFinite(pout)) {
+					out.pricing = {
+						prompt: (Number.isFinite(pin) ? pin : 0) / 1000000,
+						completion: (Number.isFinite(pout) ? pout : 0) / 1000000
+					};
+				}
 			}
 			return out;
 		};
@@ -1910,6 +1922,7 @@ function withUsageTap(stream, onUsage) {
 	const fire = () => {
 		if (fired) return;
 		fired = true;
+		if (!onUsage) return;   // Opt3 后此函数只服务转换路径；没挂回调 = 纯包装，直接跳过
 		try {
 			onUsage({ tokens: maxTotal, reasoningTokens: maxReasoning, inputTokens: maxInput, outputTokens: maxOutput });
 		} catch (e) { /* 统计失败绝不影响请求 */ }
@@ -1931,6 +1944,7 @@ function withUsageTap(stream, onUsage) {
 								if (line.indexOf('data:') !== 0) continue;
 								const s = line.slice(5).trim();
 								if (!s || s === '[DONE]') continue;
+								if (s.indexOf('tokens') === -1) continue; // Opt1: 只含 token 字段的行才跑正则（内容增量块几乎都不含，省掉 ~95% 正则执行）
 								const m = /"total_tokens"\s*:\s*(\d+)/.exec(s);
 								if (m) maxTotal = Math.max(maxTotal, Number(m[1]) || 0);
 								const mr = /"reasoning_tokens"\s*:\s*(\d+)/.exec(s);
@@ -1983,9 +1997,11 @@ async function queryProviderStats(env, range, includeInactive = false) {
 		if (hit) { if (Date.now() < hit.expiry) return hit.value; statsCache.delete(cacheKey); }
 	}
 	await ensureStatsTable(env);
-	// 第三方渠道「估算成本」单价（美元 / 千 token），纯示意估算，非真实账单。
-	// 想更准就按渠道/模型配价；这里只做 Token 级粗估，可用环境变量 THIRD_PARTY_EST_COST_PER_1K 覆盖。
-	const estRate = Number(env && env.THIRD_PARTY_EST_COST_PER_1K) || 0.011;
+	// 第三方渠道「估算成本」全局粗估单价（美元 / 千 token），仅当渠道没手填价、也没上游真实价时兜底。
+	// 2026-10-10 由 0.011（$11/百万）下调到 0.0005（$0.5/百万）：旧值对「主力走 Gemini 免费层 / Flash」
+	// 场景系统性高估 10~30 倍（那类模型真实价 ~$0.1~0.4/百万，免费层甚至为 0）。要更准优先手填渠道单价，
+	// 或设环境变量 THIRD_PARTY_EST_COST_PER_1K 覆盖。纯示意估算，非真实账单。
+	const estRate = Number(env && env.THIRD_PARTY_EST_COST_PER_1K) || 0.0005;
 
 	// 单价来源优先级：① 渠道手填单价 → ② 上游 /models 缓存里的真实价（OpenRouter 等）→ ③ 全局粗估 estRate。
 	// 手填价让 Gemini / Agnes 这类上游不公开价格的渠道也能算得比较准。
@@ -2009,8 +2025,17 @@ async function queryProviderStats(env, range, includeInactive = false) {
 	const manualPriceOf = (pid) => {
 		const p = (providersForPricing || []).find(x => x.id === String(pid));
 		const pr = p && p.pricing;
-		if (pr && (Number(pr.inputPer1M) > 0 || Number(pr.outputPer1M) > 0)) {
-			return { inputPer1M: Number(pr.inputPer1M) || 0, outputPer1M: Number(pr.outputPer1M) || 0 };
+		// 2026-10-10：pricing 里至少一个字段是显式数字（含 0）＝手填生效。
+		// 0/0 = 免费渠道 → 成本按 0 算，不回落上游价 / 粗估；负数按 0 处理，防负成本。
+		const field = (v) => {
+			if (v === undefined || v === null || v === '') return null;
+			const n = Number(v);
+			return Number.isFinite(n) && n >= 0 ? n : null;
+		};
+		const inN = pr ? field(pr.inputPer1M) : null;
+		const outN = pr ? field(pr.outputPer1M) : null;
+		if (pr && typeof pr === 'object' && (inN !== null || outN !== null)) {
+			return { inputPer1M: inN || 0, outputPer1M: outN || 0 };
 		}
 		return null;
 	};
@@ -2032,6 +2057,9 @@ async function queryProviderStats(env, range, includeInactive = false) {
 		const outputTokens = Number(o.outputTokens) || 0;
 		const total = Number(o.tokens) || 0;
 		const price = manualPriceOf(pid) || upstreamPriceOf(pid, model);
+		// 显式 0/0（手填「免费渠道」）→ 成本恒 0：连没拆入/出的老数据也不吃粗估。
+		// upstreamPriceOf 不可能返回 0/0，这支短路只会被手填价触发。
+		if (price && !(price.inputPer1M > 0) && !(price.outputPer1M > 0)) return 0;
 		if (price && (inputTokens + outputTokens) > 0) {
 			return Math.round((inputTokens / 1000000 * price.inputPer1M + outputTokens / 1000000 * price.outputPer1M) * 100) / 100;
 		}
@@ -2705,7 +2733,10 @@ async function callProvider(provider, payload, stream, env) {
 			}
 
 			if (stream) {
-				return { success: true, stream: upstream.body, ttfb };
+				// passthrough 标记：本响应是上游原始字节（未在 worker 内转换）——
+				// 只有这类流才有资格走「长流直通」（原生直管，JS 不逐 chunk 读）。Gemini 原生 /
+				// CF 账号池的流是在 worker 内转换出来的，没有这个标记。
+				return { success: true, stream: upstream.body, ttfb, passthrough: true };
 			}
 			return { success: true, data: await upstream.json(), ttfb };
 		};
@@ -2919,10 +2950,28 @@ async function callUpstream(route, payload, env, stream, ctx) {
 			// 延迟统一记 TTFB（首字节），流式/非流式口径一致（见 callProvider/callGeminiNative/callAccountPool）
 			const okMs = (r.ttfb != null) ? r.ttfb : elapsed;
 			if (stream && r.stream) {
-				// 流式：token 要等流走完才知道，交给探针在结束时落库
-				r.stream = withUsageTap(r.stream, (uo) => {
-					recordProviderCall(env, ctx, curProvider, curModel, true, okMs, false, uo.tokens, uo.reasoningTokens, uo.inputTokens, uo.outputTokens);
-				});
+				// 长流直通（2026-10-10）：上游原始透传流 + 渠道/配额组勾了 streamFastPass →
+				// 交给响应层原生直管（JS 不逐 chunk 读），免费档 CPU 10ms 下超长输出不再被掐。
+				// 代价：流内 model 不回写、token 统计没有（计次在这里立即落库；冷却/选号都在
+				// 流开始前已完成，不受影响）。Gemini 原生 / CF 账号池的流在 worker 内转换，不适用。
+				const fastPass = r.passthrough === true && (
+					(groupCfg && groupCfg.streamFastPass === true) ||
+					(curProvider && curProvider.streamFastPass === true)
+				);
+				if (fastPass) {
+					recordProviderCall(env, ctx, curProvider, curModel, true, okMs, false, 0, 0, 0, 0);
+					r.fastPass = true;
+				} else {
+					// 流式：token 要等流走完才知道，交给探针在结束时落库。
+					// Opt3（2026-10-10）：不再在这里包一层 withUsageTap（那会给每条流多加一趟
+					// decode/split/encode —— 免费档 CPU 10ms 下长流杀手，实测 1.8MB 流被 exceededResources）。
+					// 改成把回调挂到 result 上，由最终构造响应流的消费方融合：
+					//   - OpenAI 透传路径（handleCompletions）→ passthroughStream(., ., tap) 单趟完成
+					//   - Anthropic 转换路径 → withUsageTap(anthropicStreamTransform(...), tap)（转换本身要解析，保持外包）
+					r.usageTapFn = (uo) => {
+						recordProviderCall(env, ctx, curProvider, curModel, true, okMs, false, uo.tokens, uo.reasoningTokens, uo.inputTokens, uo.outputTokens);
+					};
+				}
 			} else {
 				const uo = usageOf(r);
 				recordProviderCall(env, ctx, curProvider, curModel, true, okMs, false, uo.tokens, uo.reasoningTokens, uo.inputTokens, uo.outputTokens);
@@ -3245,18 +3294,22 @@ async function handleCompletions(request, env, pathname, ctx) {
 	}
 
 	if (stream) {
-		const transformedStream = withSseHeartbeat(passthroughStream(result.stream, model));
-		return new Response(transformedStream, {
-			headers: {
-				'Content-Type': 'text/event-stream',
-				// ⚠️ 不再手动设置 Connection / Transfer-Encoding：
-				// 这两个是 hop-by-hop 头，由 Workers 运行时自己负责分帧，手动设会被忽略、
-				// 还会扰乱它的缓冲判断（社区实锤会导致长流式请求被判「代码 hang」→ 502）。
-				// 改成提示边缘「不要缓冲我」的正确姿势：
-				'Cache-Control': 'no-cache, no-transform',
-				'X-Accel-Buffering': 'no',
-			},
-		});
+		const sseHeaders = {
+			'Content-Type': 'text/event-stream',
+			// ⚠️ 不再手动设置 Connection / Transfer-Encoding：
+			// 这两个是 hop-by-hop 头，由 Workers 运行时自己负责分帧，手动设会被忽略、
+			// 还会扰乱它的缓冲判断（社区实锤会导致长流式请求被判「代码 hang」→ 502）。
+			// 改成提示边缘「不要缓冲我」的正确姿势：
+			'Cache-Control': 'no-cache, no-transform',
+			'X-Accel-Buffering': 'no',
+		};
+		// 长流直通：上游字节原样交给运行时直管（JS 不逐 chunk 读，CPU 趋近零）。
+		// 流内 model 不回写、无 token 统计 —— 换取免费档下超长输出不被 CPU 限制掐断。
+		if (result.fastPass) return new Response(result.stream, { headers: sseHeaders });
+		// Opt3：tap 回调（callUpstream 挂在 result.usageTapFn 上）与心跳都融合进透传层 ——
+		// 单层完成 model 替换 + token 抽取 + keep-alive，外加批量冲刷省 enqueue 次数。
+		const transformedStream = passthroughStream(result.stream, model, result.usageTapFn);
+		return new Response(transformedStream, { headers: sseHeaders });
 	} else {
 		const cfJson = result.data;
 		if (cfJson.model !== undefined) cfJson.model = model;
@@ -3652,8 +3705,10 @@ async function handleMessages(request, env, ctx) {
 	}
 
 	if (stream) {
-		// 流式：转换流
-		const transformedStream = withSseHeartbeat(anthropicStreamTransform(result.stream, model));
+		// 流式：转换流。Opt3：token 抽取仍外包一层 withUsageTap（转换本身必须解析每个 chunk，
+		// 省不掉），但回调从 callUpstream 的 result.usageTapFn 拿；没挂 = 纯包装不落库。
+		const anthropicStream = withUsageTap(anthropicStreamTransform(result.stream, model), result.usageTapFn);
+		const transformedStream = withSseHeartbeat(anthropicStream);
 		return new Response(transformedStream, {
 			headers: {
 				'Content-Type': 'text/event-stream',
@@ -4247,14 +4302,19 @@ function numOrNull(v) {
 	return Number.isFinite(n) && n > 0 ? n : null;
 }
 // 渠道自定义单价（美元 / 百万 tokens）。undefined = 本次未提交（编辑时保留原值）；null = 清空；对象 = 设置。
+// 2026-10-10：0/0 是合法的显式值 = 「免费渠道」（看板成本按 0 算）；两字段都缺/无效仍视为清空；负数按「该字段未填」。
 function sanitizeProviderPricing(raw) {
 	if (raw === undefined) return undefined;
 	if (!raw || typeof raw !== 'object') return null;
-	const num = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : 0; };
-	const inputPer1M = num(raw.inputPer1M);
-	const outputPer1M = num(raw.outputPer1M);
-	if (!inputPer1M && !outputPer1M) return null;
-	return { inputPer1M, outputPer1M };
+	const field = (v) => {
+		if (v === undefined || v === null || v === '') return null;
+		const n = Number(v);
+		return Number.isFinite(n) && n >= 0 ? n : null;
+	};
+	const inputPer1M = field(raw.inputPer1M);
+	const outputPer1M = field(raw.outputPer1M);
+	if (inputPer1M === null && outputPer1M === null) return null;
+	return { inputPer1M: inputPer1M || 0, outputPer1M: outputPer1M || 0 };
 }
 function normalizeModelSpec(m) {
 	if (typeof m === 'string') {
@@ -4427,11 +4487,40 @@ function withSseHeartbeat(innerStream, intervalMs = SSE_HEARTBEAT_MS) {
 	});
 }
 
-function passthroughStream(upstreamBody, modelName) {
+// 流式透传里只替换 model 字段（定点替换，避免整段 JSON.parse+stringify）。上游 model 恒为字符串，值内不含转义引号。
+const MODEL_FIELD_RE = /("model"\s*:\s*)"[^"]*"/;
+
+// Opt3（2026-10-10）：把原 withUsageTap（token 抽取层）+ withSseHeartbeat（心跳层）全部融合进透传层。
+// 为什么：免费档 CPU 10ms 下长流是杀手（实测 ~5978-chunk / 1.8MB 流被 exceededResources 杀掉）。
+// 两轮实测锁定了真凶 —— 成本在**每层 hop 的 read+enqueue**（~330µs/chunk，文本处理只占零头）：
+//   .147（tap+透传 2 层）与 .148（合并层+心跳 2 层）死亡点完全相同（~6k chunks / 2000ms CPU）。
+// 所以这一版：① 三层合一 —— 1 次 read + 最多 1 次 enqueue/hop；
+//   ② **批量冲刷** —— 攒满 FLUSH_BYTES 或上游停顿 15ms 才 enqueue 一次，把几千次 enqueue
+//   压到几十次（1.8MB ≈ 55 次）。聊天场景每 chunk 最多多 15ms 延迟，客户端渲染无感。
+// onUsage：流结束/中断时回调一次 token 统计（fire-once 语义）；不传 = 纯透传。
+// ⚠️ 阈值全部用字面量：验证脚本会把本函数单独抽出 eval，引用外部常量会 ReferenceError。
+//    （32KB 攒批 / 15ms 凑批等待 / 心跳 10s —— 想调就改这里的字面量）
+function passthroughStream(upstreamBody, modelName, onUsage, heartbeatMs) {
 	const reader = upstreamBody.getReader();
 	const decoder = new TextDecoder();
 	const encoder = new TextEncoder();
 	let buffer = '';
+	let pending = '';   // 待冲刷的输出（攒批）
+	// —— 原 withUsageTap 的统计状态（内联） ——
+	let maxTotal = 0;
+	let maxReasoning = 0;
+	let maxInput = 0;
+	let maxOutput = 0;
+	// ★ 一次性闸门：客户端中途断开时，cancel() 与收尾 finally 都会跑到，只许落库一次。
+	let fired = false;
+	const fire = () => {
+		if (fired) return;
+		fired = true;
+		if (!onUsage) return;
+		try {
+			onUsage({ tokens: maxTotal, reasoningTokens: maxReasoning, inputTokens: maxInput, outputTokens: maxOutput });
+		} catch (e) { /* 统计失败绝不影响请求 */ }
+	};
 
 	return new ReadableStream({
 		// ⚠️ 用「主动排空」（eager drain）而不是 pull(controller)。
@@ -4443,22 +4532,63 @@ function passthroughStream(upstreamBody, modelName) {
 		// 短回复恰好在一个 pull 周期内读完，长的需要反复 pull 就死。
 		// 改成在 start 里开一个独立循环主动读干上游，完全不依赖下游需求。
 		start(controller) {
+			let timer = null;
+			let closed = false;
+			const PING = encoder.encode(': keep-alive\n\n');
+			// 心跳（原 withSseHeartbeat 内联）：立刻先发一帧，告诉边缘「还活着」
+			try { controller.enqueue(PING); } catch (_) { }
+			timer = setInterval(() => {
+				if (closed) return;
+				try { controller.enqueue(PING); } catch (_) { }
+			}, Math.max(1000, Number(heartbeatMs) || 10000));
+			const finish = () => { if (!closed) { closed = true; clearInterval(timer); } };
+
 			(async () => {
 				try {
+					let scanFrom = 0;   // buffer 中已扫描过的位置（一轮 compact 一次，不再逐行 slice）
+					const flush = () => {
+						if (!pending) return;
+						controller.enqueue(encoder.encode(pending));
+						pending = '';
+					};
 					while (true) {
-						const { value, done } = await reader.read();
+						// 攒批：够 32KB 先冲再读；手里有半批 → read 和 15ms 定时器赛跑，
+						// 上游停顿就先冲已有的（保延迟）；data 先到就用 race 里已完成的那次 read，绝不重读。
+						let value, done;
+						if (pending.length >= 32768) {
+							flush();
+							({ value, done } = await reader.read());
+						} else if (pending.length > 0) {
+							const readp = reader.read();
+							let tickHandle;
+							const tickp = new Promise(res => { tickHandle = setTimeout(() => res(null), 15); });
+							let res = await Promise.race([readp.then(v => ({ v })), tickp]);
+							clearTimeout(tickHandle);
+							if (res === null) {
+								flush();   // 上游停顿 → 先把已有的发出去
+								res = { v: await readp };   // 继续等同一个 read（不丢数据、不重复读）
+							}
+							({ value, done } = res.v);
+						} else {
+							({ value, done } = await reader.read());
+						}
 						if (done) {
 							// 把缓冲区里剩下的内容输出掉
-							if (buffer.trim()) {
-								buffer = processLines(buffer, controller);
+							if (buffer.slice(scanFrom).trim()) {
+								processLines(buffer.slice(scanFrom), 0);
 							}
+							flush();
 							controller.enqueue(encoder.encode('data: [DONE]\n\n'));
 							controller.close();
 							break;
 						}
 
 						buffer += decoder.decode(value, { stream: true });
-						buffer = processLines(buffer, controller);
+						scanFrom = processLines(buffer, scanFrom);
+						if (scanFrom > 0) {
+							buffer = buffer.slice(scanFrom);   // 每 chunk 只 compact 一次
+							scanFrom = 0;
+						}
 					}
 				} catch (e) {
 					// 上游断流：发一条错误事件再正常收尾 —— 让客户端看到真实原因，
@@ -4467,42 +4597,58 @@ function passthroughStream(upstreamBody, modelName) {
 						controller.enqueue(encoder.encode(`data: {"error":{"message":${JSON.stringify(String(e && e.message || e))},"type":"server_error","code":"upstream_stream_error"}}\n\n`));
 						controller.close();
 					} catch (_) { }
+				} finally {
+					finish();
+					fire();
 				}
 			})();
 		},
-		cancel() {
-			try { reader.cancel(); } catch (_) { }
+		cancel(reason) {
+			try { reader.cancel(reason); } catch (_) { }
+			fire();
 		},
 	});
 
-	function processLines(data, controller) {
-		const lines = data.split('\n');
-		const remaining = lines.pop(); // 把最后可能不完整的一行留在缓冲区里
-
-		for (const line of lines) {
-			const trimmed = line.trim();
-			if (!trimmed) continue;
-
-			if (trimmed.startsWith('data: ')) {
-				const dataStr = trimmed.slice(6);
+	// 扫描 data.slice(from) 里的完整行：model 定点替换 + token 抽取，攒进 pending（由调用方批量冲刷）。
+	// 返回未处理行的起始下标。
+	function processLines(data, from) {
+		let pos = from;
+		while (true) {
+			const nl = data.indexOf('\n', pos);
+			if (nl === -1) break;
+			let line = data.slice(pos, nl);
+			pos = nl + 1;
+			if (line.endsWith('\r')) line = line.slice(0, -1);   // CRLF 上游；等价原 trim() 但零分配
+			if (line.length === 0) continue;
+			if (line.startsWith('data: ')) {
+				const dataStr = line.slice(6);
 				if (dataStr === '[DONE]') continue;
-
 				try {
-					const chunk = JSON.parse(dataStr);
-					// 只改模型名，其他字段全部原样透传
-					// 这样 tool_calls、finish_reason、usage、reasoning_content 都能保留下来
-					if (chunk.model !== undefined) chunk.model = modelName;
-					controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+					// Opt2: 只定点替换 model 字段，其余字节原样透传 —— 避免每个 chunk 都 JSON.parse+JSON.stringify。
+					// 函数式 replacer 规避替换串里的 $ 注入；无 model 字段的行 replace 无匹配、原串返回（零分配）。
+					const outStr = dataStr.replace(MODEL_FIELD_RE, (_, p1) => p1 + JSON.stringify(modelName));
+					pending += 'data: ' + outStr + '\n\n';
 				} catch (_) {
 					// 解析不了的行，按原样转发
-					controller.enqueue(encoder.encode(`${line}\n`));
+					pending += line + '\n';
+				}
+				// Opt1: 只含 token 字段的行才跑 4 条正则（内容增量块几乎都不含，省掉 ~95% 正则执行）
+				if (dataStr.indexOf('tokens') !== -1) {
+					const m = /"total_tokens"\s*:\s*(\d+)/.exec(dataStr);
+					if (m) maxTotal = Math.max(maxTotal, Number(m[1]) || 0);
+					const mr = /"reasoning_tokens"\s*:\s*(\d+)/.exec(dataStr);
+					if (mr) maxReasoning = Math.max(maxReasoning, Number(mr[1]) || 0);
+					const mi = /"prompt_tokens"\s*:\s*(\d+)/.exec(dataStr);
+					if (mi) maxInput = Math.max(maxInput, Number(mi[1]) || 0);
+					const mo = /"completion_tokens"\s*:\s*(\d+)/.exec(dataStr);
+					if (mo) maxOutput = Math.max(maxOutput, Number(mo[1]) || 0);
 				}
 			} else {
 				// 非 data 开头的 SSE 行（注释、事件等），原样转发
-				controller.enqueue(encoder.encode(`${line}\n`));
+				pending += line + '\n';
 			}
 		}
-		return remaining;
+		return pos;
 	}
 }
 
@@ -5199,6 +5345,9 @@ async function handleDashboardApi(request, env, ctx) {
 			const { id, name, baseUrl, apiKey, models, status, geminiNative } = body;
 			// 渠道自定义单价（美元 / 百万 tokens）；undefined = 未提交、null = 清空、对象 = 设置
 			const pricing = sanitizeProviderPricing(body.pricing);
+			// 长流直通（2026-10-10）：流式响应不做逐 chunk 读取，防免费档 CPU 10ms 掐断超长输出。
+			// 代价：流内 model 不回写、token 统计记 0（计次统计不受影响）。勾选 = true，未勾 = false。
+			const fastPassFlag = body.streamFastPass === true;
 			// Gemini 原生协议开关：true = 强制走原生 / false = 强制走旧兼容端点 / 其它(含未传) = 按 baseUrl 自动判断。
 			// 用 undefined 表示「自动」—— saveProviders 走 JSON，undefined 的键会被丢掉，所以老配置零迁移。
 			const gnFlag = geminiNative === true ? true : (geminiNative === false ? false : undefined);
@@ -5234,6 +5383,7 @@ async function handleDashboardApi(request, env, ctx) {
 						models: modelList,
 					status: status || p.status || 'active',
 					geminiNative: gnFlag,
+					streamFastPass: fastPassFlag,
 					modelHealth: nextHealth
 					};
 				});
@@ -5250,6 +5400,7 @@ async function handleDashboardApi(request, env, ctx) {
 					models: modelList,
 				status: status || 'active',
 				geminiNative: gnFlag,
+				streamFastPass: fastPassFlag,
 					createdAt: new Date().toISOString()
 				});
 			}
@@ -5509,6 +5660,9 @@ async function handleDashboardApi(request, env, ctx) {
 				resetDay: Math.max(1, Math.min(31, Math.floor(Number(body.resetDay)) || 1)),
 				// 会话粘性：同一会话尽量固定同一个成员（多轮/工具调用更稳）；默认开（未设置即视为开）
 				sticky: body.sticky !== false,
+				// 长流直通（2026-10-10）：组内成员走 OpenAI 透传时，流式响应不逐 chunk 读取，
+				// 防免费档 CPU 10ms 掐断超长输出。代价：token 统计记 0（计次/冷却/选号不受影响）。
+				streamFastPass: body.streamFastPass === true,
 				// 组级上游冷却（秒）：0 = 跟随全局默认。老组没有这个字段 → 0，行为与改造前一致（零迁移）
 				cooldownSec,
 				members
@@ -7638,6 +7792,25 @@ async function handleAdminPage(request, env, ctx) {
 			max-width: min(320px, calc(100vw - 64px));
 		}
 
+		/* ---- 成员行拖拽排序（2026-10-10，方案 C）----
+		   拖拽只是「快速改优先级」的手势：拖完按新顺序回写每行的 priority 数字，
+		   运行时语义不变（仍是「优先级定层 + 层内负载均衡」）。 */
+		.quota-drag-handle {
+			cursor: grab;
+			user-select: none;
+			-webkit-user-select: none;
+			color: var(--text-muted);
+			font-size: 15px;
+			line-height: 1;
+			text-align: center;
+			letter-spacing: 1px;
+		}
+		.quota-drag-handle:active { cursor: grabbing; }
+		.quota-member-row.dragging { opacity: .45; }
+		/* 落点指示线：拖过某行上半 / 下半分别插到它前面 / 后面 */
+		.quota-member-row.drop-above { box-shadow: 0 -2px 0 0 var(--accent-color); }
+		.quota-member-row.drop-below { box-shadow: 0 2px 0 0 var(--accent-color); }
+
 		/* Buttons */
 		.btn {
 			display: inline-flex;
@@ -9099,6 +9272,14 @@ async function handleAdminPage(request, env, ctx) {
 					</select>
 				</div>
 
+				<!-- 长流直通（2026-10-10）：免费档 CPU 10ms 会掐断超长输出（实测 1.8MB 流被 exceededResources），
+				     直通 = 流式响应不逐 chunk 读取，由运行时原生直管，CPU 趋近零。
+				     代价：流内 model 不回写、token 统计记 0（计次/冷却/负载均衡不受影响）。只对 OpenAI 协议端点生效。 -->
+				<label style="display: flex; align-items: flex-start; gap: 10px; font-size: 13px; color: var(--text-muted); cursor: pointer; margin-top: 14px;">
+					<input type="checkbox" id="provider-fastpass" style="width: 16px; height: 16px; padding: 0; margin: 2px 0 0; flex: none; accent-color: var(--accent-color);">
+					<span>长流直通（防超长输出被 CF 掐断）—— 流式响应不逐 chunk 读取，代价：流内 model 不回写、token 统计缺失（次数统计不受影响）。只对 OpenAI 协议端点生效。</span>
+				</label>
+
 			<div class="form-group" style="margin-top: 14px;">
 					<label for="provider-gemini-native">Gemini 协议（只对 googleapis 渠道有意义）</label>
 					<select id="provider-gemini-native" style="background-color: var(--input-bg); border: 1px solid var(--input-border); color: var(--input-text); padding: 12px 16px; border-radius: 10px; outline: none; font-size: 14px; font-family: inherit;">
@@ -9114,7 +9295,7 @@ async function handleAdminPage(request, env, ctx) {
 						<input type="number" id="provider-price-input" step="0.0001" min="0" placeholder="输入价 $/百万 tokens">
 						<input type="number" id="provider-price-output" step="0.0001" min="0" placeholder="输出价 $/百万 tokens">
 					</div>
-					<div class="section-note" style="margin-top: 6px;">留空 = 用上游价（OpenRouter 这类会自动带回）或全局粗估。Gemini / Agnes 这类上游不公开价格，手填后统计看板的「估算成本」更准。</div>
+					<div class="section-note" style="margin-top: 6px;">留空 = 用上游价（OpenRouter 这类会自动带回）或全局粗估。Gemini / Agnes 这类上游不公开价格，手填后统计看板的「估算成本」更准。两格都填 <b>0</b> = 标记为「免费渠道」，看板成本按 0 计。</div>
 				</div>
 
 				<div id="provider-test-result" style="display: none;">
@@ -9250,8 +9431,8 @@ async function handleAdminPage(request, env, ctx) {
 					<button class="btn btn-secondary" onclick="addQuotaMemberRow()" style="padding: 6px 12px; font-size: 12px;">添加成员</button>
 				</div>
 
-				<div style="display: grid; grid-template-columns: 56px 1.2fr 1.5fr 78px 72px 72px 34px; gap: 8px; font-size: 12px; color: var(--text-muted);">
-					<span title="数字越小越先用；同一层内仍然按负载均衡分摊">优先</span><span>渠道</span><span>上游模型名</span><span>上限</span><span>单位</span><span>状态</span><span></span>
+				<div style="display: grid; grid-template-columns: 22px 52px 1.2fr 1.5fr 78px 72px 72px 34px; gap: 8px; font-size: 12px; color: var(--text-muted);">
+					<span title="拖动这一列可排序；也可直接改数字（越小越先用）">⠿</span><span title="数字越小越先用；同一层内仍然按负载均衡分摊">优先</span><span>渠道</span><span>上游模型名</span><span>上限</span><span>单位</span><span>状态</span><span></span>
 				</div>
 				<div id="quota-members" style="display: flex; flex-direction: column; gap: 10px;"></div>
 
@@ -9305,6 +9486,13 @@ async function handleAdminPage(request, env, ctx) {
 				<label style="display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--text-muted); cursor: pointer; margin-top: 8px;">
 					<input type="checkbox" id="quota-sticky" style="width: 16px; height: 16px; padding: 0; margin: 0; flex: none; accent-color: var(--accent-color);">
 					会话粘性（默认开启；同一个会话尽量固定用同一个成员 —— 多轮对话 / 工具调用更稳，代价是分摊略不均）
+				</label>
+
+				<!-- 长流直通（2026-10-10）：免费档 CPU 10ms 会掐断超长输出。直通 = 组内成员的流式响应
+				     不逐 chunk 读取（选号/冷却/计次照旧），代价：token 统计记 0。只对 OpenAI 协议端点生效。 -->
+				<label style="display: flex; align-items: flex-start; gap: 10px; font-size: 13px; color: var(--text-muted); cursor: pointer;">
+					<input type="checkbox" id="quota-fastpass" style="width: 16px; height: 16px; padding: 0; margin: 2px 0 0; flex: none; accent-color: var(--accent-color);">
+					<span>长流直通（防超长输出被 CF 掐断）—— 流式响应不逐 chunk 读取，代价：token 统计记 0（次数/冷却/负载均衡不受影响）。只对 OpenAI 协议端点生效。</span>
 				</label>
 
 				<!-- 上游冷却放这里（而不是顶部）：它是「高级/次要」设置，放顶上会把「添加成员」顶到折叠线以下
@@ -9942,6 +10130,7 @@ async function handleAdminPage(request, env, ctx) {
 			}
 			initMapTargetCombo();
 			initQuotaModelCombo();
+			initQuotaDrag();
 			loadRuntimeState();
 			loadAccessSample();
 			if (!document.body.classList.contains('cf-off')) {
@@ -10921,10 +11110,12 @@ async function handleAdminPage(request, env, ctx) {
 			document.getElementById('provider-status').value = p ? (p.status || 'active') : 'active';
 			document.getElementById('provider-gemini-native').value =
 				(p && p.geminiNative === true) ? 'on' : ((p && p.geminiNative === false) ? 'off' : 'auto');
+			document.getElementById('provider-fastpass').checked = !!(p && p.streamFastPass === true);
+			// 回显用 != null：0 是合法的「免费渠道」值，不能当 falsy 落空（否则编辑时看不见已填的 0）。
 			document.getElementById('provider-price-input').value =
-				(p && p.pricing && p.pricing.inputPer1M) ? p.pricing.inputPer1M : '';
+				(p && p.pricing && p.pricing.inputPer1M != null) ? p.pricing.inputPer1M : '';
 			document.getElementById('provider-price-output').value =
-				(p && p.pricing && p.pricing.outputPer1M) ? p.pricing.outputPer1M : '';
+				(p && p.pricing && p.pricing.outputPer1M != null) ? p.pricing.outputPer1M : '';
 			document.getElementById('provider-modal-title').innerText = p ? '编辑第三方渠道' : '添加第三方渠道';
 			initProviderPresets();
 			document.getElementById('provider-preset').value = '';
@@ -10951,12 +11142,18 @@ async function handleAdminPage(request, env, ctx) {
 				status: document.getElementById('provider-status').value
 			};
 			if (gn !== undefined) payload.geminiNative = gn;
+			payload.streamFastPass = document.getElementById('provider-fastpass').checked === true;
 			// 计费单价：两个都空 → 显式清空（null）；否则下发对象
-			const priceIn = Number(document.getElementById('provider-price-input').value);
-			const priceOut = Number(document.getElementById('provider-price-output').value);
-			const hasIn = isFinite(priceIn) && priceIn > 0;
-			const hasOut = isFinite(priceOut) && priceOut > 0;
-			payload.pricing = (hasIn || hasOut) ? { inputPer1M: hasIn ? priceIn : 0, outputPer1M: hasOut ? priceOut : 0 } : null;
+			const rawIn = document.getElementById('provider-price-input').value.trim();
+			const rawOut = document.getElementById('provider-price-output').value.trim();
+			const priceIn = Number(rawIn);
+			const priceOut = Number(rawOut);
+			// 留空 = 未填（清空）；显式填数（含 0）= 已填。0/0 ⇒ 免费渠道（成本按 0 算）。负数钳 0。
+			const inFilled = rawIn !== '';
+			const outFilled = rawOut !== '';
+			const inN = inFilled ? (isFinite(priceIn) && priceIn >= 0 ? priceIn : 0) : 0;
+			const outN = outFilled ? (isFinite(priceOut) && priceOut >= 0 ? priceOut : 0) : 0;
+			payload.pricing = (inFilled || outFilled) ? { inputPer1M: inN, outputPer1M: outN } : null;
 			return payload;
 		}
 
@@ -11254,7 +11451,8 @@ async function handleAdminPage(request, env, ctx) {
 					baseUrl: p.baseUrl,
 					models: nextModels.join(String.fromCharCode(10)),
 					status: p.status,
-					geminiNative: p.geminiNative
+					geminiNative: p.geminiNative,
+					streamFastPass: p.streamFastPass === true
 				})
 			});
 		}
@@ -11584,7 +11782,14 @@ async function handleAdminPage(request, env, ctx) {
 			}
 			list.innerHTML = groups.map(g => {
 				const period = g.period === 'month' ? 'month' : 'day';
-				const rows = (g.members || []).map((m, i) => {
+				// ★ 卡片也按「优先级 → 配置顺序」稳定排序（2026-10-10）：与弹窗口径一致，
+				// 让卡片上「第 N 行」就是真正会优先被调用的次序（此前按配置顺序渲染，纯误导）。
+				const orderedMembers = (g.members || []).slice().sort((a, b) => {
+					const pa = (Number(a.priority) > 0 ? Math.floor(Number(a.priority)) : 1);
+					const pb = (Number(b.priority) > 0 ? Math.floor(Number(b.priority)) : 1);
+					return pa - pb;   // 稳定排序 → 同优先级保持原配置顺序
+				});
+				const rows = orderedMembers.map((m, i) => {
 					const c = quotaUsedCell(m, period);
 					return '<div style="display:grid; grid-template-columns: 20px 110px minmax(0,1fr) 110px 170px 76px; gap:10px; align-items:center; padding:8px 0; border-top:1px solid var(--border-color);">'
 						+ '<span style="font-size:12px; color: var(--text-muted);">' + (i + 1) + '</span>'
@@ -11609,6 +11814,7 @@ async function handleAdminPage(request, env, ctx) {
 					+ '<span style="font-size:12px; color:var(--text-muted);">' + memberCount + ' 个成员</span>'
 					// 组级上游冷却非默认时才显示，免得默认组挂一串噪音
 					+ (Number(g.cooldownSec) > 0 ? '<span style="font-size:12px; color:var(--text-muted);" title="组级上游冷却：覆盖「模型池挤满」与「429 限流」两类">冷却 ' + Math.floor(Number(g.cooldownSec)) + 's</span>' : '')
+					+ (g.streamFastPass === true ? '<span style="font-size:12px; color:var(--text-muted);" title="长流直通：流式不逐 chunk 读取，防超长输出被 CF CPU 限制掐断；token 统计记 0">直通</span>' : '')
 					+ '<span style="margin-left:auto; display:flex; gap:10px; align-items:center;">'
 					+ '<label class="switch" title="' + (g.status === 'disabled' ? '点击启用' : '点击停用') + '" onclick="event.stopPropagation()">'
 					+ '<input type="checkbox" data-gid="' + sen(g.id) + '"' + (g.status === 'disabled' ? '' : ' checked') + ' onchange="toggleQuotaGroupStatus(this)">'
@@ -11635,7 +11841,10 @@ async function handleAdminPage(request, env, ctx) {
 			).join('');
 			// 计量单位：'token' = 按 token 总量，其它（缺省）= 按请求条数
 			const unit = p.unit === 'token' ? 'token' : 'count';
-			return '<div class="quota-member-row" style="display: grid; grid-template-columns: 56px 1.2fr 1.5fr 78px 72px 72px 34px; gap: 8px; align-items: center;">'
+			return '<div class="quota-member-row" style="display: grid; grid-template-columns: 22px 52px 1.2fr 1.5fr 78px 72px 72px 34px; gap: 8px; align-items: center;">'
+				// 行首拖拽手柄（2026-10-10 方案 C）：拖动改「视觉顺序」，落定时按新顺序回写 priority；
+				// 与右侧数字框双向联动（改数字自动重排、拖完自动改数字）
+				+ '<span class="quota-drag-handle" draggable="true" title="拖动调整顺序（越靠上优先级越高）">⠿</span>'
 				// 组内优先级：数字越小越先用；同优先级的人之间仍然按负载均衡分摊（两者正交）
 				+ '<input type="number" class="quota-m-prio" min="1" step="1" placeholder="1" title="数字越小越先用；同一层内仍然按负载均衡分摊" value="' + (Number(p.priority) > 0 ? Math.floor(Number(p.priority)) : 1) + '" style="' + inputStyle + '">'
 				+ '<select class="quota-m-provider" onchange="syncQuotaRowModels(this)" style="' + inputStyle + '">' + opts + '</select>'
@@ -11678,11 +11887,110 @@ async function handleAdminPage(request, env, ctx) {
 		function addQuotaMemberRow() {
 			const box = document.getElementById('quota-members');
 			if (box) box.insertAdjacentHTML('beforeend', quotaEditRowHtml(null));
+			// 新行默认优先级 1；若组里已有其它优先级，让它跟着重排到「同层末尾」，所见即所得
+			if (box) sortQuotaRowsByPriority(box);
 		}
 
 		function removeQuotaMemberRow(btn) {
 			const row = btn.closest('.quota-member-row');
 			if (row) row.remove();
+		}
+
+		// ---- 成员排序（2026-10-10，方案 C）----
+		// 读一行的优先级（留空/非法一律 1，与服务端 collect 的口径一致）
+		function quotaRowPrio(row) {
+			const v = (row.querySelector('.quota-m-prio') || {}).value;
+			const n = Math.floor(Number(v));
+			return Number.isFinite(n) && n > 0 ? n : 1;
+		}
+
+		// 按「优先级 → 当前 DOM 顺序」稳定重排成员行。
+		// 只在界面上重排，不改数字；拖拽落定时另走 applyDragTier() 并进目标行那一层。
+		function sortQuotaRowsByPriority(box) {
+			if (!box) return;
+			const rows = [].slice.call(box.querySelectorAll('.quota-member-row'));
+			if (rows.length < 2) return;
+			// ★ 用「行当前下标」当稳定排序的次序键：sort 在各浏览器已稳定，
+			//   但显式带上 idx 可以保证「同优先级保持相对顺序」，不依赖引擎实现。
+			const keyed = rows.map((r, i) => ({ r, i, p: quotaRowPrio(r) }));
+			keyed.sort((a, b) => (a.p - b.p) || (a.i - b.i));
+			// 若顺序没变就不动 DOM（避免打断正在输入的数字框焦点）
+			const changed = keyed.some((k, i) => k.r !== rows[i]);
+			if (!changed) return;
+			const active = document.activeElement;
+			keyed.forEach(k => box.appendChild(k.r));
+			// 重排后把焦点还回原来的输入框（拖拽/改数字时最容易丢焦点）
+			if (active && box.contains(active)) active.focus();
+		}
+
+		// 拖拽落定：被拖的行「并到它落到的那一行所在的层」（2026-10-10，方案 C）。
+		// ★ 刻意**不做**「按视觉顺序整表重编号成 1,2,3…」：那会把用户原本手配的相同优先级
+		//   （如 3,3 表示「这两个同层、内部负载均衡」）全部拆散，等于静默废掉层内负载均衡
+		//   ——而那个语义是 2026-10-09 拍板的，且 MIN(floor(p),1) 的初始默认值就是全员 1 层。
+		//   拖拽只负责「排到第几位 / 并进哪一层」；要新建层或脱离某层，仍然手动改数字。
+		function applyDragTier(movedRow, overRow) {
+			if (!movedRow || !overRow || movedRow === overRow) return;
+			const inp = movedRow.querySelector('.quota-m-prio');
+			if (inp) inp.value = String(quotaRowPrio(overRow));
+		}
+
+		// 挂一次拖拽事件（事件委托到 #quota-members）
+		function initQuotaDrag() {
+			const box = document.getElementById('quota-members');
+			if (!box || box.dataset.dragWired === '1') return;
+			box.dataset.dragWired = '1';
+			let dragRow = null;
+
+			const clearMarks = () => {
+				[].slice.call(box.querySelectorAll('.quota-member-row')).forEach(r => {
+					r.classList.remove('dragging', 'drop-above', 'drop-below');
+				});
+			};
+
+			box.addEventListener('dragstart', (e) => {
+				const handle = e.target.closest ? e.target.closest('.quota-drag-handle') : null;
+				if (!handle) return;
+				dragRow = handle.closest('.quota-member-row');
+				if (!dragRow) return;
+				dragRow.classList.add('dragging');
+				if (e.dataTransfer) {
+					e.dataTransfer.effectAllowed = 'move';
+					// Firefox 必须有 setData 才会触发后续 drag 事件
+					try { e.dataTransfer.setData('text/plain', ''); } catch (_) { }
+				}
+			});
+
+			box.addEventListener('dragover', (e) => {
+				if (!dragRow) return;
+				e.preventDefault();               // 不 preventDefault 不会触发 drop
+				if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+				const over = e.target.closest ? e.target.closest('.quota-member-row') : null;
+				[].slice.call(box.querySelectorAll('.quota-member-row')).forEach(r => r.classList.remove('drop-above', 'drop-below'));
+				if (!over || over === dragRow) return;
+				// 以行的垂直中线判断插到上面还是下面
+				const rect = over.getBoundingClientRect();
+				const after = e.clientY > rect.top + rect.height / 2;
+				over.classList.add(after ? 'drop-below' : 'drop-above');
+			});
+
+			box.addEventListener('drop', (e) => {
+				if (!dragRow) return;
+				e.preventDefault();
+				const over = e.target.closest ? e.target.closest('.quota-member-row') : null;
+				if (over && over !== dragRow) {
+					const rect = over.getBoundingClientRect();
+					const after = e.clientY > rect.top + rect.height / 2;
+					if (after) over.insertAdjacentElement('afterend', dragRow);
+					else over.insertAdjacentElement('beforebegin', dragRow);
+					// 落到谁旁边就并进谁那一层（同级者之间仍按负载均衡分摊）
+					applyDragTier(dragRow, over);
+					sortQuotaRowsByPriority(box);
+				}
+				clearMarks();
+				dragRow = null;
+			});
+
+			box.addEventListener('dragend', () => { clearMarks(); dragRow = null; });
 		}
 
 		// ---- 配额组的「预设下拉」----
@@ -11927,16 +12235,25 @@ async function handleAdminPage(request, env, ctx) {
 			updateQuotaNamePreview();
 			document.getElementById('quota-status-active').checked = g ? g.status !== 'disabled' : true;
 			document.getElementById('quota-sticky').checked = !(g && g.sticky === false);
+			document.getElementById('quota-fastpass').checked = !!(g && g.streamFastPass === true);
 			// 上游冷却：0/缺省 → 输入框留空（= 跟随全局默认），别回显成 "0" 让人以为设了值
 			document.getElementById('quota-cooldown').value = (g && Number(g.cooldownSec) > 0) ? Math.floor(Number(g.cooldownSec)) : '';
 			document.getElementById('quota-modal-title').innerText = g ? '编辑配额组' : '新建配额组';
 
 			const members = (g && g.members) || [];
-			document.getElementById('quota-members').innerHTML = members.length
-				? members.map(m => quotaEditRowHtml(m)).join('')
+			// ★ 按「优先级 → 配置顺序」稳定排序后展示（2026-10-10）：此前直接按配置顺序渲染，
+			// 卡片上看到的顺序和真正选号用的顺序脱节，用户根本看不出实际调用次序。
+			const orderedMembers = members.slice().sort((a, b) => {
+				const pa = (Number(a.priority) > 0 ? Math.floor(Number(a.priority)) : 1);
+				const pb = (Number(b.priority) > 0 ? Math.floor(Number(b.priority)) : 1);
+				return pa - pb;   // Array.sort 稳定 → 同优先级保持原配置顺序
+			});
+			document.getElementById('quota-members').innerHTML = orderedMembers.length
+				? orderedMembers.map(m => quotaEditRowHtml(m)).join('')
 				: quotaEditRowHtml(null);
 			// 行插进 DOM 之后才能按各自选中的渠道填充模型候选
 			syncAllQuotaRowModels();
+			initQuotaDrag();
 
 			document.getElementById('quota-modal-hint').textContent = providersCache.length
 				? '已用量从调用统计里实时读取，不在这个弹窗里设置。上限填 0 表示不限；单位按你填的数字口径选「次数」或「token」。'
@@ -11990,6 +12307,7 @@ async function handleAdminPage(request, env, ctx) {
 				resetLocalTime: document.getElementById('quota-reset-time').value || '00:00',
 				resetTzOffset: tz.resetTz === 'custom' ? (Number(tz.resetTzOffset) || 0) : 0,
 				sticky: document.getElementById('quota-sticky').checked === true,
+				streamFastPass: document.getElementById('quota-fastpass').checked === true,
 				cooldownSec,
 				members: collectQuotaMembers()
 			};
@@ -12123,6 +12441,21 @@ async function handleAdminPage(request, env, ctx) {
 			box.addEventListener('input', (e) => {
 				if (!e.target.closest('.quota-m-model')) return;
 				fillQuotaRowMenu(e.target.closest('.quota-member-row'), e.target.value.trim());
+			});
+			// 改「优先」数字 → 输入停顿后自动把该行插到对应位置（所见即所得）。
+			// 用定时器防抖：连按上下箭头改数字时不要每一下都重排（会把焦点/手感打乱）。
+			let prioTimer = null;
+			box.addEventListener('input', (e) => {
+				if (!e.target.closest('.quota-m-prio')) return;
+				if (prioTimer) clearTimeout(prioTimer);
+				prioTimer = setTimeout(() => sortQuotaRowsByPriority(box), 500);
+			});
+			// 数字框按下回车也立即生效（不必等 500ms）
+			box.addEventListener('keydown', (e) => {
+				if (e.key !== 'Enter' || !e.target.closest('.quota-m-prio')) return;
+				e.preventDefault();
+				if (prioTimer) clearTimeout(prioTimer);
+				sortQuotaRowsByPriority(box);
 			});
 			box.addEventListener('keydown', (e) => {
 				if (e.key !== 'Escape') return;
