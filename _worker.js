@@ -10,7 +10,7 @@
 // ★★ 硬约定：**每次改动 _worker.js 都要把版本号 +1**（日期变了就换新日期，**序号继续递增、不重置**）。
 //    格式固定 `YYYY-MM-DD.N`。验证脚本会拦下格式不对的值，但「有没有 +1」只能靠自觉 ——
 //    曾经因为版本号没变，本地/线上分不清哪个是哪版，白排查了一整轮。
-const BUILD_ID = '2026-10-10.159';
+const BUILD_ID = '2026-10-11.160';
 
 // 系统默认密钥自动轮换参数
 const ROTATE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000; // 轮换周期：7 天
@@ -9284,7 +9284,7 @@ async function handleAdminPage(request, env, ctx) {
 
 				<div class="form-group">
 					<label for="provider-base-url">Base URL (填到 /v1 或 /v1beta/openai 为止，不要带 /chat/completions)</label>
-					<input type="text" id="provider-base-url" placeholder="如: https://api.deepseek.com/v1">
+					<input type="text" id="provider-base-url" placeholder="如: https://api.deepseek.com/v1" oninput="updateProviderFastPassRow()">
 				</div>
 
 				<div class="form-group">
@@ -9311,15 +9311,16 @@ async function handleAdminPage(request, env, ctx) {
 
 				<!-- 长流直通（2026-10-10）：免费档 CPU 10ms 会掐断超长输出（实测 1.8MB 流被 exceededResources），
 				     直通 = 流式响应不逐 chunk 读取，由运行时原生直管，CPU 趋近零。
-				     代价：流内 model 不回写、token 统计记 0（计次/冷却/负载均衡不受影响）。只对 OpenAI 协议端点生效。 -->
-				<label style="display: flex; align-items: flex-start; gap: 10px; font-size: 13px; color: var(--text-muted); cursor: pointer; margin-top: 14px;">
+				     代价：流内 model 不回写、token 统计记 0（计次/冷却/负载均衡不受影响）。只对 OpenAI 协议端点生效。
+				     Gemini 原生适配渠道（auto 命中 googleapis 或强制原生）不支持直通 → updateProviderFastPassRow() 动态隐藏本行 -->
+				<label id="provider-fastpass-row" style="display: flex; align-items: flex-start; gap: 10px; font-size: 13px; color: var(--text-muted); cursor: pointer; margin-top: 14px;">
 					<input type="checkbox" id="provider-fastpass" style="width: 16px; height: 16px; padding: 0; margin: 2px 0 0; flex: none; accent-color: var(--accent-color);">
 					<span>长流直通（防超长输出被 CF 掐断）—— 流式响应不逐 chunk 读取，代价：流内 model 不回写、token 统计缺失（次数统计不受影响）。只对 OpenAI 协议端点生效。</span>
 				</label>
 
 			<div class="form-group" style="margin-top: 14px;">
 					<label for="provider-gemini-native">Gemini 协议（只对 googleapis 渠道有意义）</label>
-					<select id="provider-gemini-native" style="background-color: var(--input-bg); border: 1px solid var(--input-border); color: var(--input-text); padding: 12px 16px; border-radius: 10px; outline: none; font-size: 14px; font-family: inherit;">
+					<select id="provider-gemini-native" onchange="updateProviderFastPassRow()" style="background-color: var(--input-bg); border: 1px solid var(--input-border); color: var(--input-text); padding: 12px 16px; border-radius: 10px; outline: none; font-size: 14px; font-family: inherit;">
 						<option value="auto">自动：地址含 googleapis 就走原生</option>
 						<option value="on">强制走原生（工具调用更稳）</option>
 						<option value="off">强制走 OpenAI 兼容端点</option>
@@ -9576,6 +9577,51 @@ async function handleAdminPage(request, env, ctx) {
 		// 以前 cf 组会按「当前模式是否生效」自动展开，导致进页面就看到一长条 —— 现统一默认收起。
 		const mappingGroupCollapsed = { cf: true, provider: true };
 		let providersCache = [];
+		// 前端镜像服务端 isGeminiProvider（2240 行）：判断渠道是否走 Gemini 原生适配层。
+		// 原生适配渠道的流必须在 worker 内逐 chunk 转协议 → 「长流直通」对它们无效，界面据此隐藏/不显示开关。
+		function providerIsGeminiNative(p) {
+			if (!p || !p.baseUrl) return false;
+			if (p.geminiNative === false) return false;
+			if (p.geminiNative === true) return true;
+			return /generativelanguage\.googleapis\.com/i.test(String(p.baseUrl));
+		}
+		function providerFastPassCapable(p) {
+			return !!p && !providerIsGeminiNative(p);
+		}
+		// 组卡片「直通」徽标条件：组内至少一个成员渠道可直通才显示；
+		// 渠道列表未加载或成员信息缺失时回退显示（宁多显示不误隐藏）
+		function quotaGroupFastPassCapable(g) {
+			const members = (g && g.members) || [];
+			if (!members.length) return true;
+			if (!providersCache.length) return true;
+			return members.some(m => providerFastPassCapable(providersCache.find(x => x.id === String(m.providerId))));
+		}
+		// 映射行「直通」开关有效性：目标解析到 Gemini 原生渠道时开关无效（流必须在 worker 内逐 chunk 转协议）；
+		// @cf/ 走账号池（流同样在 worker 内转换，无 passthrough 标记），直通也不生效。
+		// 服务端 parseProviderTarget 按「id 或 name」匹配渠道；TT: 组由组内成员决定，不在此判定。
+		function mappingFastPassCapable(target) {
+			if (typeof target !== 'string') return true;
+			const t = target.trim();
+			if (t.startsWith('@cf/')) return false;
+			if (!t.startsWith('provider:')) return true;
+			const rest = t.slice('provider:'.length);
+			const slash = rest.indexOf('/');
+			if (slash === -1) return true;
+			const key = rest.slice(0, slash).trim();
+			if (!providersCache.length) return true;
+			return providerFastPassCapable(providersCache.find(x => x.id === key || x.name === key));
+		}
+		// 渠道弹窗内实时联动：原生适配渠道的直通行隐藏并取消勾选（切回可直通时恢复）
+		function updateProviderFastPassRow() {
+			const row = document.getElementById('provider-fastpass-row');
+			if (!row) return;
+			const cb = document.getElementById('provider-fastpass');
+			const sel = document.getElementById('provider-gemini-native').value;
+			const gn = sel === 'on' ? true : (sel === 'off' ? false : undefined);
+			const native = providerIsGeminiNative({ baseUrl: document.getElementById('provider-base-url').value.trim(), geminiNative: gn });
+			row.style.display = native ? 'none' : 'flex';
+			if (native && cb && cb.checked) cb.checked = false;
+		}
 		let runtimeState = { cfPoolEnabled: true, defaultProviderId: '', accounts: 0 };
 		let healthProviderId = null;
 		let healthResults = {};
@@ -11153,6 +11199,7 @@ async function handleAdminPage(request, env, ctx) {
 			document.getElementById('provider-gemini-native').value =
 				(p && p.geminiNative === true) ? 'on' : ((p && p.geminiNative === false) ? 'off' : 'auto');
 			document.getElementById('provider-fastpass').checked = !!(p && p.streamFastPass === true);
+			updateProviderFastPassRow();
 			// 回显用 != null：0 是合法的「免费渠道」值，不能当 falsy 落空（否则编辑时看不见已填的 0）。
 			document.getElementById('provider-price-input').value =
 				(p && p.pricing && p.pricing.inputPer1M != null) ? p.pricing.inputPer1M : '';
@@ -11856,7 +11903,7 @@ async function handleAdminPage(request, env, ctx) {
 					+ '<span style="font-size:12px; color:var(--text-muted);">' + memberCount + ' 个成员</span>'
 					// 组级上游冷却非默认时才显示，免得默认组挂一串噪音
 					+ (Number(g.cooldownSec) > 0 ? '<span style="font-size:12px; color:var(--text-muted);" title="组级上游冷却：覆盖「模型池挤满」与「429 限流」两类">冷却 ' + Math.floor(Number(g.cooldownSec)) + 's</span>' : '')
-					+ (g.streamFastPass === true ? '<span style="font-size:12px; color:var(--text-muted);" title="长流直通：流式不逐 chunk 读取，防超长输出被 CF CPU 限制掐断；token 统计记 0">直通</span>' : '')
+					+ (g.streamFastPass === true && quotaGroupFastPassCapable(g) ? '<span style="font-size:12px; color:var(--text-muted);" title="长流直通：流式不逐 chunk 读取，防超长输出被 CF CPU 限制掐断；token 统计记 0">直通</span>' : '')
 					+ '<span style="margin-left:auto; display:flex; gap:10px; align-items:center;">'
 					+ '<label class="switch" title="' + (g.status === 'disabled' ? '点击启用' : '点击停用') + '" onclick="event.stopPropagation()">'
 					+ '<input type="checkbox" data-gid="' + sen(g.id) + '"' + (g.status === 'disabled' ? '' : ' checked') + ' onchange="toggleQuotaGroupStatus(this)">'
@@ -12596,12 +12643,15 @@ async function handleAdminPage(request, env, ctx) {
 			const problem = mappingInvalid[source];
 			// 逐条开关：被停用的行整行变淡 + 标红「已停用」，开关关掉
 			const off = disabledMappings.has(source);
-			// 长流直通：勾了 = 该源名的流式请求不逐 chunk 读（防免费档 CPU 掐超长输出）
-			const fp = fastPassMappings.has(source);
+			// 长流直通：勾了 = 该源名的流式请求不逐 chunk 读（防免费档 CPU 掐超长输出）；
+			// 目标是 Gemini 原生渠道时开关无效 → 不渲染开关/徽标，若残留勾选则提示清理
+			const fp = fastPassMappings.has(source) && mappingFastPassCapable(target);
+			const fpDead = fastPassMappings.has(source) && !mappingFastPassCapable(target);
 			const isPreset = Object.prototype.hasOwnProperty.call(defaultMappings, source) && defaultMappings[source] === target;
 			const typeText = (isPreset ? '<span class="badge badge-success">预设映射</span>' : '<span class="badge badge-warning">自定义</span>')
 				+ (off ? ' <span class="badge badge-danger">已停用</span>' : '')
 				+ (fp ? ' <span class="badge badge-success" title="长流直通：流式响应不逐 chunk 读取，防超长输出被 CF CPU 限制掐断；流内 model 不回写、token 统计记 0">直通</span>' : '')
+				+ (fpDead ? ' <span style="font-size:11.5px; color:var(--text-muted);" title="目标是 Gemini 原生渠道或 CF 账号池，流必须在 worker 内转换，直通不会生效">直通无效</span>' : '')
 				+ (problem ? ' <span class="badge badge-danger">未生效</span>' : '')
 				+ (problem ? '<div style="color: var(--danger-color); font-size:11.5px; margin-top:5px; max-width:220px; white-space:normal; line-height:1.5;">' + sen(problem) + '</div>' : '');
 			return '<tr' + (off ? ' style="opacity:.55;"' : '') + '>'
@@ -12609,10 +12659,12 @@ async function handleAdminPage(request, env, ctx) {
 				+ '<td><code style="cursor:pointer; word-break:break-all;" title="点击复制" data-copy="' + sen(target) + '" onclick="copyModelId(this.dataset.copy)">' + sen(target) + '</code>' + costTierBadge(target) + '</td>'
 				+ '<td>' + typeText + '</td>'
 				+ '<td style="white-space:nowrap;">'
-				+ '<label class="switch" title="' + (fp ? '点击关闭长流直通' : '点击开启长流直通（防超长输出被 CF 掐断）') + '" style="vertical-align:middle; margin-right:10px;">'
-				+ '<input type="checkbox" data-fpsrc="' + sen(source) + '"' + (fp ? ' checked' : '') + ' onchange="toggleMappingFastPass(this)">'
-				+ '<span class="switch-track"></span>'
-				+ '</label>'
+				+ (mappingFastPassCapable(target)
+					? '<label class="switch" title="' + (fp ? '点击关闭长流直通' : '点击开启长流直通（防超长输出被 CF 掐断）') + '" style="vertical-align:middle; margin-right:10px;">'
+						+ '<input type="checkbox" data-fpsrc="' + sen(source) + '"' + (fp ? ' checked' : '') + ' onchange="toggleMappingFastPass(this)">'
+						+ '<span class="switch-track"></span>'
+						+ '</label>'
+					: '<span style="display:inline-block; width:52px; text-align:center; margin-right:10px; font-size:11px; color:var(--text-muted);">—</span>')
 				+ '<label class="switch" title="' + (off ? '点击启用这条映射' : '点击停用这条映射') + '" style="vertical-align:middle;">'
 				+ '<input type="checkbox" data-src="' + sen(source) + '"' + (off ? '' : ' checked') + ' onchange="toggleMappingStatus(this)">'
 				+ '<span class="switch-track"></span>'
