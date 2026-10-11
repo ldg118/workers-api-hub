@@ -10,7 +10,7 @@
 // ★★ 硬约定：**每次改动 _worker.js 都要把版本号 +1**（日期变了就换新日期，**序号继续递增、不重置**）。
 //    格式固定 `YYYY-MM-DD.N`。验证脚本会拦下格式不对的值，但「有没有 +1」只能靠自觉 ——
 //    曾经因为版本号没变，本地/线上分不清哪个是哪版，白排查了一整轮。
-const BUILD_ID = '2026-10-11.160';
+const BUILD_ID = '2026-10-11.163';
 
 // 系统默认密钥自动轮换参数
 const ROTATE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000; // 轮换周期：7 天
@@ -885,7 +885,17 @@ function classifyUpstreamFailure(result, env, coolOverrideMs) {
 	//   · 429 但正文是额度语义 —— OpenAI 的 insufficient_quota、Gemini 的 RESOURCE_EXHAUSTED
 	//     都复用 429，光看状态码会误判成「限流 60s」，于是 60s 后又去撞（额度根本没恢复）。
 	//   注意：402 在改造前落进 `s >= 400` 分支 → retryable:false → **不换成员**，是明确的盲区。
-	const quotaExhausted = /insufficient_quota|resource_exhausted|exceeded your current quota|quota exceeded|billing/i.test(msg);
+	//   Gemini 把「每分钟限流」和「每日额度用完」都归 RESOURCE_EXHAUSTED（status 字段），且两者的
+	//   正文**都以** "You exceeded your current quota, please check your plan and billing details"
+	//   开头（.163 实测踩坑：靠额度关键词先判会把每分钟限流白关 30 分钟），真正可区分的是正文里
+	//   的 limit_id：...PerMinute... / "Please retry in Xs" = 几十秒自愈的限流；...PerDay... = 当天不恢复。
+	//   所以 429 时 PerMinute 标记优先于额度关键词；PerDay 仍直接长冷却；无任何区分信息的
+	//   RESOURCE_EXHAUSTED 维持旧判（长冷却，保守）。
+	const perMinuteLimit = /per\s*minute|perminute|requests per minute|please\s+retry\s+in\s+[\d.]+\s*s/i.test(msg);
+	const perDayLimit = /per\s*day|perday|daily\s+(quota|limit)/i.test(msg);
+	const quotaExhausted = (s === 429 && perDayLimit)
+		|| (/insufficient_quota|exceeded your current quota|quota exceeded|billing/i.test(msg) && !(s === 429 && perMinuteLimit && !perDayLimit))
+		|| (s === 429 && /resource_exhausted/i.test(msg) && !perMinuteLimit && !/retry\s+in/i.test(msg));
 	if (s === 402 || (s === 429 && quotaExhausted)) {
 		out = { retryable: true, transient: false, coolMs: QUOTA_COOLDOWN_QUOTA_MS, reason: `上游 ${s}（额度/余额已耗尽）` };
 	}
@@ -1763,6 +1773,7 @@ const STATS_TABLE_SQL = `CREATE TABLE IF NOT EXISTS stats (
 	reasoning_tokens INTEGER NOT NULL DEFAULT 0,
 	input_tokens INTEGER NOT NULL DEFAULT 0,
 	output_tokens INTEGER NOT NULL DEFAULT 0,
+	fp_req INTEGER NOT NULL DEFAULT 0,
 	last_ms INTEGER NOT NULL DEFAULT 0,
 	last_at TEXT,
 	PRIMARY KEY (day, provider_id, model)
@@ -1791,6 +1802,8 @@ async function ensureStatsTable(env) {
 			// 成本估算要按输入/输出各自单价算，故分开存（老数据为 0 → 成本侧自动回落粗估）
 			['input_tokens', 'INTEGER NOT NULL DEFAULT 0'],
 			['output_tokens', 'INTEGER NOT NULL DEFAULT 0'],
+			// 长流直通请求数：直通流的 token 拿不到（记 0），看板靠这列区分「直通记 0」和「真没数据」
+			['fp_req', 'INTEGER NOT NULL DEFAULT 0'],
 			['last_ms', 'INTEGER NOT NULL DEFAULT 0'],
 			['last_at', 'TEXT']
 		];
@@ -1817,7 +1830,9 @@ async function ensureStatsTable(env) {
 //   - 失败只丢这一条计数，绝不影响代理本身
 // isProbe = true 表示这是「测试连通 / 测模型」这类探测调用 —— 单独计数（probe_*），
 // 但配额判断会把两者相加，因为上游是按总请求数算额度的，测试同样消耗它。
-function recordProviderCall(env, ctx, provider, model, ok, ms, isProbe, tokens, reasoningTokens, inputTokens, outputTokens) {
+// isFastPass = true 表示这次走了「长流直通」—— token 拿不到记 0，fp_req 单独计数，
+// 看板据此在 Token 数旁标「直通」，免得误读成「没数据」。
+function recordProviderCall(env, ctx, provider, model, ok, ms, isProbe, tokens, reasoningTokens, inputTokens, outputTokens, isFastPass) {
 	if (!env.DB) return;
 	// 桶是「小时」而不是「天」：配额组的重置时刻可以不在 UTC 零点（如 Gemini 是太平洋午夜
 	// = UTC 07:00），只有小时级的桶才能把周期边界切准。列名仍叫 day（SQLite 改主键成本高），
@@ -1835,9 +1850,9 @@ function recordProviderCall(env, ctx, provider, model, ok, ms, isProbe, tokens, 
 			`INSERT INTO stats (day, provider_id, provider_name, model,
 			                    req, ok, fail, ms_total,
 			                    probe_req, probe_ok, probe_fail, probe_ms_total, tokens, reasoning_tokens,
-			                    input_tokens, output_tokens,
+			                    input_tokens, output_tokens, fp_req,
 			                    last_ms, last_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(day, provider_id, model) DO UPDATE SET
 			   provider_name = excluded.provider_name,
 			   req = req + excluded.req,
@@ -1852,6 +1867,7 @@ function recordProviderCall(env, ctx, provider, model, ok, ms, isProbe, tokens, 
 			   reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens,
 			   input_tokens = input_tokens + excluded.input_tokens,
 			   output_tokens = output_tokens + excluded.output_tokens,
+			   fp_req = fp_req + excluded.fp_req,
 			   last_ms = CASE WHEN (excluded.ok = 1 OR excluded.probe_ok = 1) THEN excluded.last_ms ELSE last_ms END,
 			   last_at = CASE WHEN (excluded.ok = 1 OR excluded.probe_ok = 1) THEN excluded.last_at ELSE last_at END`
 		).bind(
@@ -1871,6 +1887,7 @@ function recordProviderCall(env, ctx, provider, model, ok, ms, isProbe, tokens, 
 			probe ? 0 : reasoningRounded,
 			probe ? 0 : inputRounded,
 			probe ? 0 : outputRounded,
+			(!probe && isFastPass) ? 1 : 0,
 			// 最近一次 = 覆盖写：转发和探测都算（后台「重测」的延迟要能立刻反映到看板）
 			msRounded,
 			new Date().toISOString()
@@ -2078,6 +2095,7 @@ async function queryProviderStats(env, range, includeInactive = false) {
 		'SELECT provider_id, provider_name, model, substr(day,1,10) AS d, req, ok, fail, ms_total AS msTotal,'
 		+ ' probe_req AS probeReq, probe_ok AS probeOk, probe_fail AS probeFail, probe_ms_total AS probeMsTotal,'
 		+ ' tokens, reasoning_tokens AS reasoningTokens, input_tokens AS inputTokens, output_tokens AS outputTokens,'
+		+ ' fp_req AS fpReq,'
 		+ ' last_at AS lastAt, last_ms AS lastMs FROM stats'
 		+ (mergedSince ? ' WHERE day >= ?' : '')
 	);
@@ -2100,7 +2118,7 @@ async function queryProviderStats(env, range, includeInactive = false) {
 				cur = {
 					provider_id: pid, provider_name: r.provider_name, model: r.model,
 					req: 0, ok: 0, fail: 0, msTotal: 0, probeReq: 0, probeOk: 0, probeFail: 0, probeMsTotal: 0,
-					tokens: 0, reasoningTokens: 0, inputTokens: 0, outputTokens: 0, lastAt: null, lastMs: 0
+					tokens: 0, reasoningTokens: 0, inputTokens: 0, outputTokens: 0, fpReq: 0, lastAt: null, lastMs: 0
 				};
 				rowAgg.set(k, cur);
 			}
@@ -2109,6 +2127,7 @@ async function queryProviderStats(env, range, includeInactive = false) {
 			cur.probeFail += r.probeFail || 0; cur.probeMsTotal += r.probeMsTotal || 0;
 			cur.tokens += r.tokens || 0; cur.reasoningTokens += r.reasoningTokens || 0;
 			cur.inputTokens += r.inputTokens || 0; cur.outputTokens += r.outputTokens || 0;
+			cur.fpReq += r.fpReq || 0;
 			// 等价原 SQL 的「MAX(last_at) + 裸列 last_ms」：取 last_at 最新那一行的 last_ms
 			if (r.lastAt && (!cur.lastAt || String(r.lastAt) >= String(cur.lastAt))) { cur.lastAt = r.lastAt; cur.lastMs = r.lastMs || 0; }
 		}
@@ -2133,7 +2152,7 @@ async function queryProviderStats(env, range, includeInactive = false) {
 	for (const r of rows) {
 		const key = String(r.provider_id);
 		if (!byProvider.has(key)) {
-			byProvider.set(key, { id: key, name: r.provider_name, req: 0, ok: 0, fail: 0, msTotal: 0, probeReq: 0, probeOk: 0, probeFail: 0, probeMsTotal: 0, tokens: 0, reasoningTokens: 0, inputTokens: 0, outputTokens: 0, costEst: 0, models: [] });
+			byProvider.set(key, { id: key, name: r.provider_name, req: 0, ok: 0, fail: 0, msTotal: 0, probeReq: 0, probeOk: 0, probeFail: 0, probeMsTotal: 0, tokens: 0, reasoningTokens: 0, inputTokens: 0, outputTokens: 0, fpReq: 0, costEst: 0, models: [] });
 		}
 		const p = byProvider.get(key);
 		p.req += r.req || 0;
@@ -2148,6 +2167,7 @@ async function queryProviderStats(env, range, includeInactive = false) {
 		p.reasoningTokens += r.reasoningTokens || 0;
 		p.inputTokens += r.inputTokens || 0;
 		p.outputTokens += r.outputTokens || 0;
+		p.fpReq += r.fpReq || 0;
 		// 渠道级「最近一次」= 各模型里时刻最新的那个
 		if (r.lastAt && (!p.lastAt || r.lastAt > p.lastAt)) { p.lastAt = r.lastAt; p.lastMs = r.lastMs || 0; }
 		if (r.provider_name) p.name = r.provider_name;
@@ -2168,6 +2188,7 @@ async function queryProviderStats(env, range, includeInactive = false) {
 			reasoningTokens: r.reasoningTokens || 0,
 			inputTokens: r.inputTokens || 0,
 			outputTokens: r.outputTokens || 0,
+			fpReq: r.fpReq || 0,
 			costEst: modelCost,
 			probeReq: r.probeReq || 0,
 			probeOk: r.probeOk || 0,
@@ -2187,6 +2208,7 @@ async function queryProviderStats(env, range, includeInactive = false) {
 		reasoningTokens: o.reasoningTokens || 0,
 		inputTokens: o.inputTokens || 0,
 		outputTokens: o.outputTokens || 0,
+		fpReq: o.fpReq || 0,
 		costEst: costOverride != null ? costOverride : Math.round((o.tokens || 0) / 1000 * estRate * 100) / 100,
 		probeReq: o.probeReq || 0,
 		probeOk: o.probeOk || 0,
@@ -2204,8 +2226,9 @@ async function queryProviderStats(env, range, includeInactive = false) {
 		a.probeFail += p.probeFail || 0; a.probeMsTotal += p.probeMsTotal || 0;
 		a.tokens += p.tokens || 0; a.reasoningTokens += p.reasoningTokens || 0;
 		a.inputTokens += p.inputTokens || 0; a.outputTokens += p.outputTokens || 0;
+		a.fpReq += p.fpReq || 0;
 		return a;
-	}, { req: 0, ok: 0, fail: 0, msTotal: 0, probeReq: 0, probeOk: 0, probeFail: 0, probeMsTotal: 0, tokens: 0, reasoningTokens: 0, inputTokens: 0, outputTokens: 0 });
+	}, { req: 0, ok: 0, fail: 0, msTotal: 0, probeReq: 0, probeOk: 0, probeFail: 0, probeMsTotal: 0, tokens: 0, reasoningTokens: 0, inputTokens: 0, outputTokens: 0, fpReq: 0 });
 
 	const out = {
 		enabled: true,
@@ -2959,7 +2982,7 @@ async function callUpstream(route, payload, env, stream, ctx) {
 					(Array.isArray(fpCfg.fastPassMappings) && fpCfg.fastPassMappings.indexOf(payload.model) !== -1)
 				);
 				if (fastPass) {
-					recordProviderCall(env, ctx, curProvider, curModel, true, okMs, false, 0, 0, 0, 0);
+					recordProviderCall(env, ctx, curProvider, curModel, true, okMs, false, 0, 0, 0, 0, true);
 					r.fastPass = true;
 				} else {
 					// 流式：token 要等流走完才知道，交给探针在结束时落库。
@@ -10168,7 +10191,7 @@ async function handleAdminPage(request, env, ctx) {
 					+ '<td>' + (p.ok || 0) + ' / ' + (p.fail || 0) + '</td>'
 				+ '<td>' + (p.req ? p.okRate + '%' : '—') + '</td>'
 				+ '<td>' + statsLatencyCell(p.avgMs, p.req, p.lastMs, p.lastAt) + '</td>'
-					+ '<td>' + (p.tokens || 0).toLocaleString() + '</td>'
+					+ '<td>' + (p.tokens || 0).toLocaleString() + (p.fpReq ? ' <span style="font-size:11px; color:var(--text-muted);" title="含 ' + (p.fpReq || 0) + ' 次长流直通请求：直通流拿不到 token 用量，这几次的 token 记 0">直通</span>' : '') + '</td>'
 					+ '<td>' + (p.reasoningTokens || 0).toLocaleString() + '</td>'
 					+ '<td>$' + (p.costEst != null ? p.costEst.toFixed(2) : '0.00') + '</td>'
 					+ '</tr>';
@@ -10181,7 +10204,7 @@ async function handleAdminPage(request, env, ctx) {
 					+ '<td style="font-size:12.5px;">' + (m.ok || 0) + ' / ' + (m.fail || 0) + '</td>'
 					+ '<td style="font-size:12.5px;">' + (m.req ? Math.round(m.ok / m.req * 1000) / 10 + '%' : '—') + '</td>'
 					+ '<td style="font-size:12.5px;">' + statsLatencyCell(m.avgMs, m.req, m.lastMs, m.lastAt) + '</td>'
-					+ '<td style="font-size:12.5px;">' + (m.tokens || 0).toLocaleString() + '</td>'
+					+ '<td style="font-size:12.5px;">' + (m.tokens || 0).toLocaleString() + (m.fpReq ? ' <span style="font-size:11px; color:var(--text-muted);" title="含 ' + (m.fpReq || 0) + ' 次长流直通请求：直通流拿不到 token 用量，这几次的 token 记 0">直通</span>' : '') + '</td>'
 					+ '<td style="font-size:12.5px;">' + (m.reasoningTokens || 0).toLocaleString() + '</td>'
 					+ '<td style="font-size:12.5px;">$' + (m.costEst != null ? m.costEst.toFixed(2) : '0.00') + btn + '</td>'
 					+ '</tr>';
