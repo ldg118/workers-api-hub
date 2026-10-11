@@ -10,7 +10,7 @@
 // ★★ 硬约定：**每次改动 _worker.js 都要把版本号 +1**（日期变了就换新日期，**序号继续递增、不重置**）。
 //    格式固定 `YYYY-MM-DD.N`。验证脚本会拦下格式不对的值，但「有没有 +1」只能靠自觉 ——
 //    曾经因为版本号没变，本地/线上分不清哪个是哪版，白排查了一整轮。
-const BUILD_ID = '2026-10-11.163';
+const BUILD_ID = '2026-10-11.164';
 
 // 系统默认密钥自动轮换参数
 const ROTATE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000; // 轮换周期：7 天
@@ -9421,12 +9421,12 @@ async function handleAdminPage(request, env, ctx) {
 			</div>
 			<div class="modal-body">
 				<div class="section-note" id="model-spec-endpoint"></div>
-				<div id="model-spec-content" style="max-height: 52vh; overflow: auto;"></div>
+				<div id="model-spec-content"></div>
 				<div class="section-note" style="margin-top: 10px;">规格来自上游 <code>/models</code> 接口，能否拿到取决于上游。<b>价格仅供参考</b>。<code>—</code> = 上游未提供该字段。</div>
 			</div>
 			<div class="modal-footer">
 				<button class="btn btn-secondary" onclick="closeModelSpecModal()">关闭</button>
-				<button class="btn btn-secondary" id="btn-spec-refresh" onclick="reloadModelSpecs()">重新拉取</button>
+				<button class="btn btn-primary" id="btn-spec-refresh" onclick="reloadModelSpecs()">重新拉取</button>
 			</div>
 		</div>
 	</div>
@@ -11429,13 +11429,15 @@ async function handleAdminPage(request, env, ctx) {
 					+ '</tr>';
 			}
 			// table-layout:fixed + 各列显式宽度 → 不再出现横向滚动条，长内容改为优雅换行
-			// 表头一律 nowrap + 留够宽度（否则「上下文/最大输出」会被单元格内边距挤成两行）
+			// 表头一律 nowrap + 留够宽度（否则「上下文/最大输出」会被单元格内边距挤成两行）。
+			// 表头吸顶（sticky）：滚动只有 modal-body 一层，长列表往下滚时列名不消失。
+			const th = 'position: sticky; top: 0; background-color: var(--card-bg); z-index: 1; box-shadow: 0 1px 0 var(--border-color);';
 			box.innerHTML = '<table style="width: 100%; table-layout: fixed;"><thead><tr>'
-				+ '<th style="width: auto; white-space: nowrap;">模型</th>'
-				+ '<th style="width: 96px; text-align: right; white-space: nowrap;">上下文</th>'
-				+ '<th style="width: 104px; text-align: right; white-space: nowrap;">最大输出</th>'
-				+ '<th style="width: 136px; white-space: nowrap;">价格</th>'
-				+ '<th style="width: 30%; white-space: nowrap;">能力 / 参数</th>'
+				+ '<th style="' + th + ' width: auto; white-space: nowrap;">模型</th>'
+				+ '<th style="' + th + ' width: 96px; text-align: right; white-space: nowrap;">上下文</th>'
+				+ '<th style="' + th + ' width: 104px; text-align: right; white-space: nowrap;">最大输出</th>'
+				+ '<th style="' + th + ' width: 136px; white-space: nowrap;">价格</th>'
+				+ '<th style="' + th + ' width: 30%; white-space: nowrap;">能力 / 参数</th>'
 				+ '</tr></thead><tbody>' + rows + '</tbody></table>'
 				+ '<div class="section-note" style="margin-top: 8px;">只列本渠道已添加的 ' + saved.length + ' 个模型'
 				+ (missing ? '（其中 ' + missing + ' 个上游未返回）' : '')
