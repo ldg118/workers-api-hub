@@ -10,7 +10,7 @@
 // ★★ 硬约定：**每次改动 _worker.js 都要把版本号 +1**（日期变了就换新日期，**序号继续递增、不重置**）。
 //    格式固定 `YYYY-MM-DD.N`。验证脚本会拦下格式不对的值，但「有没有 +1」只能靠自觉 ——
 //    曾经因为版本号没变，本地/线上分不清哪个是哪版，白排查了一整轮。
-const BUILD_ID = '2026-10-13.176';
+const BUILD_ID = '2026-10-13.177';
 
 // 系统默认密钥自动轮换参数
 const ROTATE_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000; // 轮换周期：7 天
@@ -4787,7 +4787,7 @@ async function handleDashboardApi(request, env, ctx) {
 		return new Response(JSON.stringify({ success: true }), {
 			headers: {
 				'Content-Type': 'application/json',
-				'Set-Cookie': `admin_token=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=14400`
+				'Set-Cookie': `admin_token=${token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=14400`
 			}
 		});
 		}
@@ -4801,7 +4801,7 @@ async function handleDashboardApi(request, env, ctx) {
 		return new Response(JSON.stringify({ success: true }), {
 			headers: {
 				'Content-Type': 'application/json',
-				'Set-Cookie': `admin_token=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0`
+				'Set-Cookie': `admin_token=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0`
 			}
 		});
 	}
